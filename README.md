@@ -73,4 +73,25 @@ hints.md文件内容示例：
 通过 Skill & Command，可以扩展EVA的各种能力。
 
 
+## 关于Contribution
+
+💗💗💗
+
+欢迎大家为EVA项目贡献，如提高EVA的自主水平、增加其他语言的单文件版本、甚至英文版等等。
+
+当前EVA的设计，有下面几点考虑：
+
+1. 尽量发挥EVA的自主性，让EVA自我驱动去解决问题，而非加各种流程约束
+2. 保持极简。我想就是因为简单，所以EVA才不简单。“完美不是在没有东西可以增加的时候，而是在没有东西可以删除的时候”
+3. 长程任务连续性。当前的记忆压缩仍然比较粗暴，无法很好保证压缩后的任务延续性，希望有更优雅的方法进行记忆压缩（工程上我们可以类似Claude Code那样做各种层次化压缩，但还记得前面第1点吗，需要尽量发挥EVA的自主性，因此希望记忆压缩可以更简单、更优雅、更AI自我驱动）
+4. 自进化。机器人三大定律本来只是插在EVA中的一个meme，但它好像跟智能体发展挺契合的。当前自进化实现方式仍然比较粗暴，完全靠EVA记录知识、技能和线索，期望有更优雅的方式
+
+<a href="https://www.star-history.com/?repos=usepr%2Feva&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=usepr/eva&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=usepr/eva&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=usepr/eva&type=date&legend=top-left" />
+ </picture>
+</a>
+
 **古法编程、匠心打造** [狗头]
