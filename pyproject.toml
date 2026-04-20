@@ -1,0 +1,26 @@
+[project]
+name = "atfield"
+version = "0.1.0"
+description = "A secure, capability-based agent kernel with sandboxed execution and tamper-proof audit logs. 基于能力模型的安全智能体内核，支持沙箱执行与防篡改审计."
+authors = [
+    {name = "gckellan",email = "gckellan@gmail.com"}
+]
+license = {text = "Apache-2.0"}
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.28.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
