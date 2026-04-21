@@ -37,12 +37,14 @@ def detect_model_len():
     except Exception as e:
         print(f"错误：无法连接到 {EVA_BASE_URL}，请检查 EVA_BASE_URL 配置。\n详情：{e}")
         sys.exit(1)
+
     if resp.status_code == 401:
-        print(f"错误：API Key 无效或未授权，请检查 EVA_API_KEY 配置。")
+        print("错误：API Key 无效或未授权，请检查 EVA_API_KEY 配置。")
         sys.exit(1)
     if resp.status_code != 200:
         print(f"错误：获取模型列表失败（HTTP {resp.status_code}）：{resp.text[:200]}")
         sys.exit(1)
+
     out = resp.json()
     for d in out["data"]:
         if d["id"] == EVA_MODEL_NAME:
@@ -73,9 +75,8 @@ SHELL = "powershell.exe" if IS_WINDOWS else "bash"
 SHELL_FLAG = "-Command" if IS_WINDOWS else "-c"
 ENCODING = "utf-8"
 
+
 # ====================== 环境探针 ======================
-
-
 def collect_env_info():
     cmds = {
         "Linux": [
@@ -231,39 +232,51 @@ def read_input(prompt=""):
         return ""
 
 
-def run_cli(command: str, timeout: int = 30) -> str:
-    """执行 Shell 命令"""
-    global ALLOW_ALL_CLI
-    try:
-        if not ALLOW_ALL_CLI:
-            msg, _ = llm_chat(
-                [
-                    {
-                        "role": "user",
-                        "content": CLI_REVIEW_PROMPT.format(command=command),
-                    }
-                ],
-                temperature=0.0,
-                thinking=False,
-            )
-            if "放行" not in msg["content"]:
-                ans = read_input("Yes (默认) | No | 直接 Ctrl+C 打断：")
-                if "n" in ans.lower():
-                    return "用户拒绝运行此命令"
+def review_command(command: str) -> bool:
+    """
+    安全审查：调用 LLM 判断命令是否可放行。
+    """
+    if ALLOW_ALL_CLI:
+        return True
+    msg, _ = llm_chat(
+        [{"role": "user", "content": CLI_REVIEW_PROMPT.format(command=command)}],
+        temperature=0.0,
+        thinking=False,
+    )
+    if "放行" in msg["content"]:
+        return True
+    ans = read_input("Yes (默认) | No | 直接 Ctrl+C 打断：")
+    return "n" not in ans.lower()
 
-        result = subprocess.run(
-            [SHELL, SHELL_FLAG, command],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            cwd=os.getcwd(),
-            timeout=timeout,
-            shell=False,
-        )
-        output = f"Exit code: {result.returncode}\n{result.stdout}"
-        if result.stderr:
-            output += f"\nSTDERR:\n{result.stderr}"
-        return output.strip() or "(no output)"
+
+def execute_direct(command: str, timeout: int) -> str:
+    """
+    直接执行命令（无沙箱回退）。
+    """
+    result = subprocess.run(
+        [SHELL, SHELL_FLAG, command],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        cwd=os.getcwd(),
+        timeout=timeout,
+        shell=False,
+    )
+    output = f"Exit code: {result.returncode}\n{result.stdout}"
+    if result.stderr:
+        output += f"\nSTDERR:\n{result.stderr}"
+    return output.strip() or "(no output)"
+
+
+def run_cli(command: str, timeout: int = 30) -> str:
+    """
+    执行 Shell 命令。
+    安全链路：LLM 审查 → 直接执行（TODO：未来替换为沙箱执行）
+    """
+    try:
+        if not review_command(command):
+            return "用户拒绝运行此命令"
+        return execute_direct(command, timeout)
     except Exception as e:
         return f"执行失败：{str(e)}"
 
@@ -271,7 +284,6 @@ def run_cli(command: str, timeout: int = 30) -> str:
 def leave_memory_hints(hints: str) -> str:
     """
     保存记忆线索到文件，并裁剪对话历史。
-
     在记忆容量即将耗尽时调用（COMPACT_PANIC 模式），
     将关键记忆写入 hints.md，并重置对话历史。
     """
