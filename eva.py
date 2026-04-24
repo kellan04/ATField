@@ -877,6 +877,170 @@ def main() -> None:
 # ============================================================================
 # 17. ToolRegistry 类
 # ============================================================================
+
+# ============================================================================
+# 18. Agent 类
+# ============================================================================
+class Agent:
+    """
+    核心 Agent：串联 LLMClient / ToolRegistry / Memory / AgentContext。
+    单一职责：管理 Agent ↔ User 的交互循环。
+    """
+
+    def __init__(
+        self,
+        config: "AgentConfig",
+        platform: "Platform",
+        ctx: AgentContext,
+        memory: Memory,
+    ):
+        self.config = config
+        self.platform = platform
+        self.ctx = ctx
+        self.memory = memory
+        self.tools = ToolRegistry(config, platform, ctx)
+        self.tools.setup_builtin_tools()
+
+    def _read_input(self, prompt: str = "") -> str:
+        """读取用户输入"""
+        try:
+            return input(prompt)
+        except EOFError:
+            return ""
+
+    def _single_loop(self) -> None:
+        """
+        单次 Agent 循环。
+        流程：LLM推理 → 工具执行 → token超限检测
+        """
+        break_loop = False
+        while not break_loop:
+            try:
+                sys.stdout.write("\n[*] EVA: ")
+                sys.stdout.flush()
+
+                # 选择工具集（compact_panic 模式额外提供 leave_memory_hints）
+                schemas = self.tools.get_schemas()
+                if self.ctx.compact_panic != "on":
+                    schemas = [
+                        s for s in schemas
+                        if s["function"]["name"] != "leave_memory_hints"
+                    ]
+
+                msg, usage = llm_chat_stream(self.ctx.messages, tools=schemas)
+                self.ctx.messages.append(msg)
+
+                sys.stdout.write("\n\n")
+                sys.stdout.flush()
+
+                if not msg.get("tool_calls"):
+                    break
+
+                for tc in msg["tool_calls"]:
+                    name = tc["function"]["name"]
+                    try:
+                        args = json.loads(tc["function"]["arguments"])
+                        print(f"===> 执行工具：{name}")
+                        for k, v in args.items():
+                            print(f"{k}: {v}")
+                        print("\n")
+                        result = self.tools.execute(name, args)
+                    except KeyboardInterrupt:
+                        print("\n\n工具调用已中断，回到用户 turn")
+                        result = "用户中止该工具运行"
+                        break_loop = True
+                    except Exception as e:
+                        result = f"工具执行异常：{str(e)}"
+
+                    print("<=== 工具返回：")
+                    if len(result) > 6000:
+                        lines = f"{result[:6000]}\n... 后面内容省略".splitlines()
+                    else:
+                        lines = result.splitlines()
+                    print("\n".join(lines[:30]))
+                    if len(lines) > 30:
+                        print("\n... 后面内容省略")
+                    print("\n\n")
+
+                    # 工具结果追加到 messages（leave_memory_hints 特殊处理）
+                    if name == "leave_memory_hints":
+                        usage["total_tokens"] = 0
+                    else:
+                        if len(result) > self.config.tool_result_len:
+                            result = f"{result[:self.config.tool_result_len]}\n...文本太长，已省略"
+                        self.ctx.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": name,
+                            "content": clean_input(result),
+                        })
+
+                    # token 超限检测
+                    if (self.ctx.compact_panic == "off"
+                            and usage["total_tokens"] >= self.config.token_cap * self.config.compact_thresh):
+                        print("！！！紧急回合，触发记忆压缩")
+                        self.ctx.compact_panic = "on"
+                        self.ctx.messages.append(
+                            {"role": "user", "content": COMPACT_PROMPT}
+                        )
+
+            except KeyboardInterrupt:
+                print("\n\nagent_single_loop 已中断，回到用户 turn")
+                break_loop = True
+                break
+            except Exception as e:
+                print(f"LLM 调用异常：{e}")
+                traceback.print_exc()
+                break
+
+    def _human_loop(self, user_ask: str | None = None) -> None:
+        """人与 Agent 的主对话循环"""
+        while True:
+            try:
+                if user_ask:
+                    user_input = user_ask
+                    print(f"[-] You: {user_input}\n")
+                else:
+                    print("")
+                    user_input = self._read_input("[-] You: ").strip()
+
+                self.ctx.messages.append({
+                    "role": "user",
+                    "content": clean_input(user_input),
+                })
+                self._single_loop()
+
+                if user_ask:
+                    break
+            except KeyboardInterrupt:
+                self.memory.save_session(self.ctx.messages)
+                print("\n已中断，会话已保存")
+                break
+            except Exception as e:
+                print(f"主循环异常：{e}")
+                break
+
+    def run(self, user_ask: str | None = None) -> None:
+        """
+        对外统一入口：
+        1. 构建初始 messages（含 system prompt，hints 最新值）
+        2. 加载 session history 并追加（单次模式不加载）
+        3. 启动对话循环
+        """
+        # 1. 构建初始 messages
+        self.ctx.messages = self.memory.build_initial_messages()
+
+        # 2. 加载 session history 并追加
+        if not user_ask:
+            history = self.memory.load_session()
+            if history is not None:
+                self.ctx.messages.extend(history)
+
+        # 3. 启动对话循环
+        self._human_loop(user_ask)
+
+
+
 class ToolRegistry:
     """
     工具注册中心：Schema 和 Handler 分离。
