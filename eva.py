@@ -870,5 +870,135 @@ def main() -> None:
     human_loop(args.user_ask, _ctx)
 
 
+# ============================================================================
+# 16. Memory 类
+# ============================================================================
+class Memory:
+    """记忆管理：hints 线索 + session 持久化"""
+
+    def __init__(
+        self,
+        workspace_dir: Path,
+        hint_file: Path,
+        env_info: str,
+    ):
+        self.workspace_dir = workspace_dir
+        self.hint_file = hint_file
+        self.env_info = env_info
+        self._hints: str | None = None
+        self._session_file: Path | None = None
+
+    # ---- hints ----
+
+    def load_hints(self) -> str:
+        """懒加载 hints 文件内容"""
+        if self._hints is None:
+            if self.hint_file.exists():
+                self._hints = self.hint_file.read_text(encoding="utf-8")
+            else:
+                self._hints = ""
+        return self._hints
+
+    def save_hints(self, hints: str) -> None:
+        """保存 hints"""
+        self.hint_file.write_text(hints, encoding="utf-8")
+        self._hints = hints
+
+    def build_initial_messages(self) -> list[dict]:
+        """
+        构建初始 messages（含当前 hints 的 system prompt）。
+        每次新会话或加载会话时调用，确保 hints 最新值生效。
+        """
+        hints = self.load_hints()
+        return [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT.format(
+                    hints=hints if hints else "无",
+                    env_info=self.env_info,
+                ),
+            }
+        ]
+
+    # ---- session 文件路径 ----
+
+    def get_session_file(self) -> Path:
+        """获取当前工作目录对应的 session 文件"""
+        if self._session_file is None:
+            current_dir = Path.cwd()
+            dir_hash = re.sub(r"[\\/:]", "_", str(current_dir))
+            session_dir = self.workspace_dir / "sessions"
+            session_dir.mkdir(exist_ok=True)
+            self._session_file = session_dir / f"{dir_hash}.json"
+        return self._session_file
+
+    # ---- session 操作（仅 conversation history，不含 system message）----
+
+    def save_session(self, messages: list[dict]) -> None:
+        """
+        保存对话历史（仅 conversation history）。
+        messages[0] 是 system message，不写入 session 文件。
+        """
+        history = messages[1:] if len(messages) > 1 else []
+        sf = self.get_session_file()
+        sf.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n> 会话已保存到：{sf}")
+
+    def load_session(self) -> list[dict] | None:
+        """
+        加载对话历史（仅 conversation history）。
+        返回的列表不含 system message，调用方需自行拼接到 build_initial_messages() 结果后。
+        """
+        sf = self.get_session_file()
+        if not sf.exists():
+            return None
+        try:
+            history = json.loads(sf.read_text(encoding="utf-8"))
+            if history and history[-1]["role"] == "assistant":
+                last_msg = history[-1]
+                if "tool_calls" in last_msg:
+                    del last_msg["tool_calls"]
+                    if not last_msg.get("content"):
+                        del history[-1]
+            size_KB = (sf.stat().st_size + 1000 - 1) // 1000
+            print(f"\n> 会话已从文件加载：{sf} ({size_KB:,} KB)")
+            return history
+        except json.JSONDecodeError:
+            print(f"> 会话文件损坏：{sf}")
+            return None
+
+    def list_sessions(self) -> None:
+        """列出所有 session"""
+        sf = self.get_session_file()
+        session_dir = sf.parent
+        print(f"目录: {session_dir}\n")
+        if not session_dir.exists():
+            print("> 没有找到任何会话记录。")
+            return
+        files = [f for f in session_dir.iterdir() if f.suffix == ".json"]
+        if not files:
+            print("> 没有找到任何会话记录。")
+            return
+        print(f"> 共找到 {len(files)} 个会话:")
+        print("-" * 60)
+        for i, f in enumerate(sorted(files), start=1):
+            size_KB = (f.stat().st_size + 1000 - 1) // 1000
+            marker = "    <=== 当前目录" if f == sf else ""
+            print(f"  {i}. {f.name} ({size_KB:,} KB){marker}")
+        print("-" * 60)
+
+    def clear_session(self) -> None:
+        """清除当前 session"""
+        sf = self.get_session_file()
+        if sf.exists():
+            try:
+                sf.unlink()
+                print(f"> 已清除会话：{sf}")
+            except KeyboardInterrupt:
+                print("已取消")
+        else:
+            print(f"> 会话不存在：{sf}")
+
+
 if __name__ == "__main__":
     main()
