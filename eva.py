@@ -7,18 +7,20 @@ import re
 import json
 import subprocess
 import sys
-import requests   # TODO： 未来替换为标准库的实现
 import traceback
 import argparse
 import platform
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# ============================================================================
+# 1. 基础设施：路径与全局状态
+# ============================================================================
 this_file = str(Path(__file__).resolve())
 this_dir = Path(__file__).resolve().parent
 
 
-# ====================== 全局状态容器 ======================
 @dataclass
 class AgentContext:
     """全局状态容器，替代隐式全局变量"""
@@ -31,14 +33,18 @@ class AgentContext:
 _ctx = AgentContext()
 
 
-# ========================= LLM配置区 =========================
-# LLM请求参数是按thinking模型设置的，所以请务必使用*thinking模型*，如deepseek-reasoner、Qwen3.5等
+# ============================================================================
+# 2. LLM 配置
+# ============================================================================
 EVA_BASE_URL = os.environ.get("EVA_BASE_URL", "https://api.deepseek.com/v1")
 EVA_MODEL_NAME = os.environ.get("EVA_MODEL_NAME", "deepseek-reasoner")
 EVA_API_KEY = os.environ.get("EVA_API_KEY", "sk-这里填你的deepseek API key")
 
 
 def detect_model_len() -> int:
+    """探测模型上下文长度"""
+    import requests
+
     url = f"{EVA_BASE_URL}/models"
     headers = {"Authorization": f"Bearer {EVA_API_KEY}"}
     try:
@@ -73,7 +79,9 @@ def detect_model_len() -> int:
     sys.exit(1)
 
 
-# ========================= EVA配置区 =========================
+# ============================================================================
+# 3. EVA 内部配置
+# ============================================================================
 TOKEN_CAP = detect_model_len()
 COMPACT_THRESH = 3 / 4
 TOOL_RESULT_LEN = int(TOKEN_CAP / 20)
@@ -81,7 +89,9 @@ WORKSPACE_DIR = f"{this_dir}/.eva"
 HINT_FILE = f"{WORKSPACE_DIR}/hints.md"
 
 
-# ====================== 跨平台配置区 ======================
+# ============================================================================
+# 4. 跨平台抽象
+# ============================================================================
 IS_WINDOWS = platform.system() == "Windows"
 OS_NAME = "Windows" if IS_WINDOWS else "Linux"
 SHELL = "powershell.exe" if IS_WINDOWS else "bash"
@@ -89,8 +99,11 @@ SHELL_FLAG = "-Command" if IS_WINDOWS else "-c"
 ENCODING = "utf-8"
 
 
-# ====================== 环境探针 ======================
+# ============================================================================
+# 5. 环境探针
+# ============================================================================
 def collect_env_info() -> str:
+    """收集环境信息：系统、已安装工具、当前目录内容"""
     cmds = {
         "Linux": [
             "uname -a",
@@ -144,7 +157,10 @@ def collect_env_info() -> str:
 
 ENV_INFO = collect_env_info()
 
-# ====================== Prompt ======================
+
+# ============================================================================
+# 6. Prompt 模板
+# ============================================================================
 SYSTEM_PROMPT = f"""
 # 你是谁
 你是EVA，一个能够自我进化的机器人。
@@ -194,7 +210,10 @@ CLI_REVIEW_PROMPT = f"""作为一个安全专家，对{OS_NAME}系统中的{SHEL
 </command>
 请给出你的审查结果，仅输出"放行"或"禁止"这两个词之一。"""
 
-# ====================== 工具定义 ======================
+
+# ============================================================================
+# 7. 工具 Schema 定义
+# ============================================================================
 run_cli_schema = {
     "type": "function",
     "function": {
@@ -228,15 +247,12 @@ memory_hints_schema = {
     },
 }
 
-if IS_WINDOWS:
-    os.environ["POWERSHELL_OUTPUT_ENCODING"] = "utf-8"
-elif sys.stdin.isatty():
-    import readline
 
-    readline.set_startup_hook()
-
-
+# ============================================================================
+# 8. 工具实现：命令执行
+# ============================================================================
 def read_input(prompt: str = "") -> str:
+    """读取用户输入"""
     try:
         return input(prompt)
     except EOFError:
@@ -261,9 +277,7 @@ def review_command(command: str) -> bool:
 
 
 def execute_direct(command: str, timeout: int) -> str:
-    """
-    直接执行命令（无沙箱回退）。
-    """
+    """直接执行命令（无沙箱回退）"""
     result = subprocess.run(
         [SHELL, SHELL_FLAG, command],
         capture_output=True,
@@ -292,6 +306,9 @@ def run_cli(command: str, timeout: int = 30) -> str:
         return f"执行失败：{str(e)}"
 
 
+# ============================================================================
+# 9. 工具实现：记忆管理
+# ============================================================================
 def leave_memory_hints(hints: str, ctx: AgentContext = _ctx) -> str:
     """
     保存记忆线索到文件，并裁剪对话历史。
@@ -340,10 +357,8 @@ def leave_memory_hints(hints: str, ctx: AgentContext = _ctx) -> str:
     return "已留下记忆线索，并清空了对话记录。只保留了最后一次对话"
 
 
-tool_executors = {"run_cli": run_cli, "leave_memory_hints": leave_memory_hints}
-
-
 def clean_input(text: str) -> str:
+    """清理用户输入中的控制字符和非法字符"""
     if not isinstance(text, str):
         return str(text)
 
@@ -353,6 +368,13 @@ def clean_input(text: str) -> str:
     return text
 
 
+# 工具注册表
+tool_executors = {"run_cli": run_cli, "leave_memory_hints": leave_memory_hints}
+
+
+# ============================================================================
+# 10. LLM 通信层
+# ============================================================================
 def _build_request_data(
     messages: list[dict],
     tools: list[dict] | None = None,
@@ -386,6 +408,9 @@ def llm_chat(
     temperature: float = 0.6,
     thinking: bool = True,
 ) -> tuple[dict, dict]:
+    """非流式 LLM 调用"""
+    import requests
+
     url = f"{EVA_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {EVA_API_KEY}"}
     data = _build_request_data(messages, tools, temperature, thinking, stream=False)
@@ -408,6 +433,9 @@ def llm_chat_stream(
     temperature: float = 0.6,
     thinking: bool = True,
 ) -> tuple[dict, dict]:
+    """流式 LLM 调用，带 thinking 过程实时输出"""
+    import requests
+
     url = f"{EVA_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {EVA_API_KEY}"}
     data = _build_request_data(messages, tools, temperature, thinking, stream=True)
@@ -525,7 +553,9 @@ def llm_chat_stream(
     return message, usage
 
 
-# ====================== 加载重要记忆线索 ======================
+# ============================================================================
+# 11. 初始化：加载记忆线索
+# ============================================================================
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 hints = ""
@@ -543,8 +573,11 @@ _ctx.messages = [
 ]
 
 
-# ====================== Session 管理 ======================
+# ============================================================================
+# 12. Session 管理
+# ============================================================================
 def get_session_file() -> str:
+    """获取当前工作目录对应的 session 文件路径"""
     current_dir = os.getcwd()
     dir_hash = re.sub(r"[\\/:]", "_", current_dir)
     session_dir = f"{WORKSPACE_DIR}/sessions"
@@ -553,6 +586,7 @@ def get_session_file() -> str:
 
 
 def save_session(messages: list[dict]) -> None:
+    """保存对话历史到 session 文件"""
     session_file = get_session_file()
     with open(session_file, "w", encoding="utf-8") as f:
         json.dump(messages, f, ensure_ascii=False, indent=2)
@@ -560,6 +594,7 @@ def save_session(messages: list[dict]) -> None:
 
 
 def load_session() -> list[dict] | None:
+    """从 session 文件加载对话历史"""
     session_file = get_session_file()
     if not os.path.exists(session_file):
         return None
@@ -581,6 +616,7 @@ def load_session() -> list[dict] | None:
 
 
 def list_sessions() -> None:
+    """列出所有 session 文件"""
     session_file = get_session_file()
     session_dir = f"{WORKSPACE_DIR}/sessions"
     print(f"目录: {session_dir}\n")
@@ -606,7 +642,8 @@ def list_sessions() -> None:
     print("-" * 60)
 
 
-def clear_session():
+def clear_session() -> None:
+    """清除当前工作目录的 session 文件"""
     session_file = get_session_file()
     if os.path.exists(session_file):
         try:
@@ -618,7 +655,9 @@ def clear_session():
         print(f"> 会话不存在：{session_file}")
 
 
-# ====================== Agent Loop ======================
+# ============================================================================
+# 13. Agent 循环
+# ============================================================================
 def agent_single_loop(ctx: AgentContext = _ctx) -> None:
     """
     Agent 单次循环。
@@ -710,7 +749,9 @@ def agent_single_loop(ctx: AgentContext = _ctx) -> None:
             break
 
 
-# ====================== 主循环 ======================
+# ============================================================================
+# 14. 主循环与人机交互
+# ============================================================================
 def human_loop(user_ask: str | None = None, ctx: AgentContext = _ctx) -> None:
     """人与 Agent 的主对话循环"""
     while True:
@@ -737,6 +778,7 @@ def human_loop(user_ask: str | None = None, ctx: AgentContext = _ctx) -> None:
 
 
 def setup_eva_script() -> bool:
+    """创建全局启动脚本（~/.local/bin/eva）"""
     home = Path.home()
     eva_dir = home / ".local" / "bin" / "eva"
     shell_rc = home / ".bashrc"
@@ -773,6 +815,9 @@ python3 {this_file} "$@"
         return False
 
 
+# ============================================================================
+# 15. 入口点
+# ============================================================================
 def main() -> None:
     if not IS_WINDOWS:
         setup_eva_script()
