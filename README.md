@@ -17,7 +17,7 @@
 ```bash
 export EVA_API_KEY="sk-xxxxxxxx"
 export EVA_BASE_URL="https://api.deepseek.com/v1"
-export EVA_MODEL_NAME="deepseek-reasoner"
+export EVA_MODEL_NAME="deepseek-v4-pro"
 
 python3 eva.py
 ```
