@@ -2,6 +2,9 @@
 EVA：一个能够自我进化的机器人
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import re
 import json
@@ -36,7 +39,7 @@ class AgentContext:
 # 3. LLM 配置
 # ============================================================================
 EVA_BASE_URL = os.environ.get("EVA_BASE_URL", "https://api.deepseek.com/v1")
-EVA_MODEL_NAME = os.environ.get("EVA_MODEL_NAME", "deepseek-reasoner")
+EVA_MODEL_NAME = os.environ.get("EVA_MODEL_NAME", "deepseek-v4-pro")
 EVA_API_KEY = os.environ.get("EVA_API_KEY", "sk-这里填你的deepseek API key")
 
 
@@ -275,7 +278,7 @@ def _build_request_data(
     thinking: bool = True,
     stream: bool = False,
 ) -> dict:
-    """构建 LLM 请求参数"""
+    """构建 LLM 请求参数（适配 deepseek-v4 API）"""
     data = {
         "model": EVA_MODEL_NAME,
         "messages": messages,
@@ -285,8 +288,11 @@ def _build_request_data(
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
-        "chat_template_kwargs": {"enable_thinking": thinking},
     }
+    # deepseek-v4: thinking 模式通过 thinking 对象启用
+    if thinking:
+        data["thinking"] = {"type": "enabled"}
+        data["reasoning_effort"] = "high"
     if tools:
         data["tools"] = tools
     if stream:
