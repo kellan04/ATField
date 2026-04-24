@@ -873,6 +873,170 @@ def main() -> None:
 # ============================================================================
 # 16. Memory 类
 # ============================================================================
+
+# ============================================================================
+# 17. ToolRegistry 类
+# ============================================================================
+class ToolRegistry:
+    """
+    工具注册中心：Schema 和 Handler 分离。
+    Phase 3 预留注入点：capability_gate / sandbox
+    """
+
+    def __init__(
+        self,
+        config: "AgentConfig",
+        platform: "Platform",
+        ctx: AgentContext,
+    ):
+        self.config = config
+        self.platform = platform
+        self.ctx = ctx
+        self._schemas: dict[str, dict] = {}
+        self._handlers: dict[str, callable] = {}
+
+    # ---- 内置工具实现 ----
+
+    def _review_command(self, command: str) -> bool:
+        """安全审查：LLM 判断命令是否可放行"""
+        if self.ctx.allow_all_cli:
+            return True
+        prompt = CLI_REVIEW_PROMPT.format(command=command)
+        msg, _ = llm_chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.0,
+            thinking=False,
+        )
+        if "放行" in msg["content"]:
+            return True
+        ans = input("Yes (默认) | No | Ctrl+C 打断：")
+        return "n" not in ans.lower()
+
+    def _execute_direct(self, command: str, timeout: int) -> str:
+        """直接执行命令（无沙箱）。Phase 3 替换为 sandbox.run()"""
+        result = subprocess.run(
+            [self.platform.shell, self.platform.shell_flag, command],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            cwd=os.getcwd(),
+            timeout=timeout,
+            shell=False,
+        )
+        output = f"Exit code: {result.returncode}\n{result.stdout}"
+        if result.stderr:
+            output += f"\nSTDERR:\n{result.stderr}"
+        return output.strip() or "(no output)"
+
+    def _run_cli(self, command: str, timeout: int = 30) -> str:
+        """执行 Shell 命令"""
+        try:
+            if not self._review_command(command):
+                return "用户拒绝运行此命令"
+            return self._execute_direct(command, timeout)
+        except Exception as e:
+            return f"执行失败：{str(e)}"
+
+    def _leave_memory_hints(self, hints: str) -> str:
+        """
+        保存记忆线索到文件，并裁剪对话历史。
+        修改 self.ctx.messages（重新构建）和 self.ctx.compact_panic。
+        """
+        compact_i = -1
+        for i in range(len(self.ctx.messages) - 1, -1, -1):
+            if (self.ctx.messages[i]["role"] == "user"
+                    and self.ctx.messages[i]["content"] == COMPACT_PROMPT):
+                compact_i = i
+                break
+
+        last_user_i = compact_i - 1
+        for i in range(last_user_i, -1, -1):
+            if self.ctx.messages[i]["role"] == "user":
+                last_user_i = i
+                break
+
+        self.ctx.messages = (
+            [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT.format(
+                        hints=hints,
+                        env_info=self.platform.env_info,
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": "《系统提示》！！！之前任务过程占用了太多token，记忆已耗尽，记忆压缩被触发。\n"
+                    "不过别担心，记忆压缩时你已经调用leave_memory_hints保留下了关键内容...\n"
+                    "======== 最后的回答内容，开始 ========",
+                },
+            ]
+            + self.ctx.messages[last_user_i:compact_i]
+            + [
+                {
+                    "role": "user",
+                    "content": "======== 最后的回答内容，结束 ========\n"
+                    "请开始确认你自己的任务状态，继续完成任务\n",
+                }
+            ]
+        )
+        self.ctx.compact_panic = "off"
+
+        self.platform.hint_file.write_text(hints, encoding="utf-8")
+        return "已留下记忆线索，并清空了对话记录。只保留了最后一次对话"
+
+    # ---- 注册接口 ----
+
+    def register(self, schema: dict, handler: callable) -> None:
+        """注册工具 schema 和 handler"""
+        name = schema["function"]["name"]
+        self._schemas[name] = schema
+        self._handlers[name] = handler
+
+    def get_schemas(self) -> list[dict]:
+        """获取所有 schema（供 LLM tools 参数使用）"""
+        return list(self._schemas.values())
+
+    def execute(self, name: str, args: dict) -> str:
+        """执行工具"""
+        if name not in self._handlers:
+            return f"未知工具：{name}"
+        return self._handlers[name](**args)
+
+    def setup_builtin_tools(self) -> None:
+        """注册内置工具（启动时调用一次）"""
+        run_cli_schema = {
+            "type": "function",
+            "function": {
+                "name": "run_cli",
+                "description": f"执行任意 {self.platform.shell} 命令",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer", "default": 30},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }
+        memory_hints_schema = {
+            "type": "function",
+            "function": {
+                "name": "leave_memory_hints",
+                "description": "留下记忆文件的相关线索",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"hints": {"type": "string"}},
+                    "required": ["hints"],
+                },
+            },
+        }
+        self.register(run_cli_schema, self._run_cli)
+        self.register(memory_hints_schema, self._leave_memory_hints)
+
+
+
 class Memory:
     """记忆管理：hints 线索 + session 持久化"""
 
