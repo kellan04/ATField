@@ -238,6 +238,16 @@ class EVATUI(App):
         self._content_buf: list[str] = []
         self._thinking_widget: Static | None = None
 
+    def _on_thinking(self, text: str) -> None:
+        """Agent thinking 回调 — 缓冲并调度到主线程"""
+        self._thinking_buf.append(text)
+        full = "".join(self._thinking_buf)
+        self.call_from_thread(self._show_thinking, full[:80])
+
+    def _on_content(self, text: str) -> None:
+        """Agent content 回调 — 缓冲内容"""
+        self._content_buf.append(text)
+
     def compose(self) -> ComposeResult:
         yield Static(f"EVA TUI  |  {EVA_MODEL_NAME}  |  Token Cap: {TOKEN_CAP // 1000}k", classes="header")
         yield ScrollableContainer(id="conv_scroll")
@@ -252,7 +262,7 @@ class EVATUI(App):
             "role": "user",
             "content": "你好，介绍一下你自己",
         })
-        self._run_single_step()
+        self.run_worker(self._run_single_step, thread=True)
 
     def _render_rich(self, text: str, style: str = "") -> Text:
         """用 Rich 渲染 Markdown/JSON，返回 Text"""
@@ -360,8 +370,7 @@ class EVATUI(App):
 
             self._content_buf = []
             self._thinking_buf = []
-            resume_result = self.agent.resume([])
-            self._process_result(resume_result)
+            # 工具结果已显示，等待 caller 调度 resume
             return
 
         elif result.status == "compact_panic":
@@ -369,8 +378,6 @@ class EVATUI(App):
                 Text("⚠️ 记忆压缩触发", style="bold #ff6b6b"),
             ))
             scroll.scroll_end(animate=False)
-            resume_result = self.agent.resume([])
-            self._process_result(resume_result)
             return
 
         # completed
@@ -391,17 +398,23 @@ class EVATUI(App):
         self.agent.memory.save_session(self.agent.ctx.messages)
 
     def _run_single_step(self) -> None:
+        """在 worker 线程执行 LLM 调用，回调 DOM 操作到主线程"""
         result = self.agent.step()
+        self.call_from_thread(self._process_and_maybe_resume, result)
+
+    def _process_and_maybe_resume(self, result: AgentResult) -> None:
+        """在主线程处理 LLM 结果，必要时继续 resume"""
         self._process_result(result)
+        # resume 需要再次调用 LLM，切换到 worker 线程
+        if result.status == "waiting_for_tool":
+            self.run_worker(self._resume_next, thread=True)
+        elif result.status == "compact_panic":
+            self.run_worker(self._resume_next, thread=True)
 
-    def _on_thinking(self, text: str) -> None:
-        self._thinking_buf.append(text)
-        # 更新 thinking 进度
-        full = "".join(self._thinking_buf)
-        self._show_thinking(full[:80])
-
-    def _on_content(self, text: str) -> None:
-        self._content_buf.append(text)
+    def _resume_next(self) -> None:
+        """继续工具执行后的推理"""
+        resume_result = self.agent.resume([])
+        self.call_from_thread(self._process_and_maybe_resume, resume_result)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         user_text = event.value.strip()
@@ -416,7 +429,8 @@ class EVATUI(App):
         self._content_buf = []
         self._thinking_widget = None
 
-        self._run_single_step()
+        # 用线程执行，避免阻塞 UI
+        self.run_worker(self._run_single_step, thread=True)
 
     def action_clear_conv(self) -> None:
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
