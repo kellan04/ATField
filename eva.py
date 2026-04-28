@@ -1123,6 +1123,13 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
     _debug_log: list[str] = []
     _debug_file = WORKSPACE_DIR / "debug.log"
 
+    def _safe_print(msg: dict):
+        """打印 JSON 到 stdout，忽略 BrokenPipeError"""
+        try:
+            print(json.dumps(msg), flush=True)
+        except BrokenPipeError:
+            pass
+
     def _log(level: str, direction: str, msg: dict):
         if debug:
             ts = dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1134,15 +1141,15 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
 
     # 事件回调 → JSON 发送到 stdout
     def on_thinking(text: str):
-        print(json.dumps({"type": "event", "event": "thinking", "data": text}), flush=True)
+        _safe_print({"type": "event", "event": "thinking", "data": text})
         _log("DEBUG", "OUT event", {"event": "thinking", "data": text[:50]})
 
     def on_content(text: str):
-        print(json.dumps({"type": "event", "event": "content", "data": text}), flush=True)
+        _safe_print({"type": "event", "event": "content", "data": text})
         _log("DEBUG", "OUT event", {"event": "content", "data": text[:50]})
 
     def on_compact_panic():
-        print(json.dumps({"type": "event", "event": "compact_panic"}), flush=True)
+        _safe_print({"type": "event", "event": "compact_panic"})
         _log("DEBUG", "OUT event", {"event": "compact_panic"})
 
     agent.on_thinking = on_thinking
@@ -1153,11 +1160,11 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
         if result.status == "waiting_for_tool":
             for tc in result.tool_calls:
                 out = {"type": "tool_call", "id": tc["id"], "name": tc["name"], "args": tc["args"]}
-                print(json.dumps(out), flush=True)
+                _safe_print(out)
                 _log("DEBUG", "OUT", out)
         else:
             out = {"type": "response", "status": result.status, "content": (result.content or "")[:80], "reasoning": (result.reasoning or "")[:80]}
-            print(json.dumps(out), flush=True)
+            _safe_print(out)
             _log("DEBUG", "OUT", out)
 
     def execute_tools_and_resume():
@@ -1166,7 +1173,7 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
         for tc in agent._pending_tool_calls:
             name = tc["name"]
             out_start = {"type": "event", "event": "tool_start", "id": tc["id"], "name": name}
-            print(json.dumps(out_start), flush=True)
+            _safe_print(out_start)
             _log("DEBUG", "OUT event", out_start)
             try:
                 res = agent.tools.execute(name, tc["args"])
@@ -1175,7 +1182,7 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
                 res = f"工具执行异常：{str(e)}"
                 _log("ERROR", "TOOL", {"name": name, "error": str(e)})
             out_res = {"type": "event", "event": "tool_result", "id": tc["id"], "result": res[:200]}
-            print(json.dumps(out_res), flush=True)
+            _safe_print(out_res)
             _log("DEBUG", "OUT event", out_res)
             tool_results.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": res})
         agent.ctx.messages.extend(tool_results)
@@ -1195,7 +1202,7 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
             if history:
                 agent.ctx.messages.extend(history)
                 _log("INFO", "INIT", {"history_len": len(history)})
-            print(json.dumps({"type": "ready"}), flush=True)
+            _safe_print({"type": "ready"})
             _log("DEBUG", "OUT", {"type": "ready"})
 
         elif t == "user_message":
@@ -1209,11 +1216,11 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
         elif t == "save_session":
             agent.memory.save_session(agent.ctx.messages)
             _log("INFO", "SAVE", {"messages": len(agent.ctx.messages)})
-            print(json.dumps({"type": "session_saved"}), flush=True)
+            _safe_print({"type": "session_saved"})
             _log("DEBUG", "OUT", {"type": "session_saved"})
 
         elif t == "ping":
-            print(json.dumps({"type": "pong"}), flush=True)
+            _safe_print({"type": "pong"})
             _log("DEBUG", "OUT", {"type": "pong"})
 
         else:
