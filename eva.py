@@ -1188,7 +1188,7 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
                 "role": "tool",
                 "tool_call_id": tc["id"],
                 "name": name,
-                "content": res,
+                "content": clean_input(res),
             })
         agent.ctx.messages.extend(tool_results)
         agent._pending_tool_calls.clear()
