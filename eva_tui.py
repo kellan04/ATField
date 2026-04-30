@@ -235,8 +235,10 @@ class EVATUI(App):
                 full = "".join(self._thinking_buf)
                 self.call_from_thread(self._show_thinking, full[:80])
             elif event == "content":
+                self._finalize_thinking()
                 self._content_buf.append(msg.get("data", ""))
             elif event == "tool_start":
+                self._finalize_thinking()
                 name = msg.get("name", "?")
                 args = msg.get("args", {})
                 self.call_from_thread(self._append_tool_start, name, args)
