@@ -244,6 +244,7 @@ class EVATUI(App):
                 args = msg.get("args", {})
                 self.call_from_thread(self._append_tool_start, name, args)
             elif event == "tool_result":
+                self._thinking_buf.clear()
                 id = msg.get("id", "")
                 result = msg.get("result", "")
                 self.call_from_thread(self._append_tool_result, id, result)
