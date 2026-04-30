@@ -238,6 +238,7 @@ class EVATUI(App):
                 self._finalize_thinking()
                 self._content_buf.append(msg.get("data", ""))
             elif event == "tool_start":
+                self._thinking_buf.clear()
                 self._finalize_thinking()
                 name = msg.get("name", "?")
                 args = msg.get("args", {})
