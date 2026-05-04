@@ -83,6 +83,8 @@ Or export environment variables:
 export EVA_API_KEY="sk-..."
 export EVA_BASE_URL="https://api.deepseek.com/v1"
 export EVA_MODEL_NAME="deepseek-v4-pro"
+# Optional: enable HMAC-signed memory (generate key with: python3 -c "import secrets; print(secrets.token_hex(32))")
+export EVA_HMAC_KEY="your-secret-key"
 poetry run python eva.py
 ```
 
@@ -120,6 +122,21 @@ All tool executions are logged to `.eva/audit/{date}.jsonl`:
 ```json
 {"time":"2026-04-29T18:35:01.277","tool":"run_cli","command_hash":"abc123","exit_code":0,"cap":["EXEC"],"result_len":156,"denied":false}
 ```
+
+### Memory Integrity (HMAC)
+
+Set `EVA_HMAC_KEY` to enable tamper-proof signing of hints and session files:
+
+```bash
+# Generate a secure key
+python3 -c "import secrets; print(secrets.token_hex(32))"
+# Output: a1b2c3d4e5f6... (64 char hex string)
+
+export EVA_HMAC_KEY="a1b2c3d4e5f6..."
+poetry run python eva.py
+```
+
+Without `EVA_HMAC_KEY`, memory files work normally (no signing). With the key set, any tampering with hints or session files will cause an `INTEGRITY_ERROR` on load.
 
 ## Project Structure
 
@@ -162,7 +179,7 @@ poetry run ruff check eva.py eva_tui.py
 | Offline mode (no import network) | ✅ Implemented |
 | Sandbox execution (firejail/sandbox-exec) | ⬜ Planned |
 | Prompt injection firewall (InputGuard) | ⬜ Planned |
-| HMAC-signed memory (tamper-proof) | ⬜ Planned |
+| HMAC-signed memory (tamper-proof) | ✅ Implemented |
 
 See [todo/hardening_plan.md](todo/hardening_plan.md) for detailed design specs.
 
