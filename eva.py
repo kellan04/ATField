@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
+import hmac
 import json
 import os
 import platform
@@ -168,6 +169,7 @@ class ExitCode:
     NETWORK_ERROR = 2
     MODEL_NOT_FOUND = 3
     TOOL_DENIED = 4
+    INTEGRITY_ERROR = 5
     UNKNOWN = 99
 
 
@@ -177,6 +179,12 @@ class EVAError(Exception):
         self.code = code
         self.message = message
         super().__init__(message)
+
+
+class IntegrityError(EVAError):
+    """记忆文件被篡改"""
+    def __init__(self, message: str):
+        super().__init__(ExitCode.INTEGRITY_ERROR, message)
 
 
 class ConfigError(EVAError):
@@ -589,19 +597,37 @@ class Memory:
         self.env_info = env_info
         self._hints: str | None = None
         self._session_file: Path | None = None
+        self._hmac_key = os.environ.get("EVA_HMAC_KEY", "")
 
     def load_hints(self) -> str:
-        """懒加载 hints 文件内容"""
+        """懒加载 hints 文件内容（带 HMAC 校验）"""
         if self._hints is None:
             if self.hint_file.exists():
-                self._hints = self.hint_file.read_text(encoding="utf-8")
+                raw = self.hint_file.read_text(encoding="utf-8")
+                if not raw:
+                    self._hints = ""
+                elif self._hmac_key:
+                    parts = raw.split("\n", 1)
+                    if len(parts) == 2:
+                        sig, content = parts
+                        if hmac.new(self._hmac_key.encode(), content.encode(), "sha256").hexdigest() != sig:
+                            raise IntegrityError(f"hints 文件被篡改：{self.hint_file}")
+                        self._hints = content
+                    else:
+                        self._hints = raw  # 无签名格式，兼容旧文件
+                else:
+                    self._hints = raw
             else:
                 self._hints = ""
         return self._hints
 
     def save_hints(self, hints: str) -> None:
-        """保存 hints"""
-        self.hint_file.write_text(hints, encoding="utf-8")
+        """保存 hints（带 HMAC 签名）"""
+        if self._hmac_key:
+            sig = hmac.new(self._hmac_key.encode(), hints.encode(), "sha256").hexdigest()
+            self.hint_file.write_text(f"{sig}\n{hints}", encoding="utf-8")
+        else:
+            self.hint_file.write_text(hints, encoding="utf-8")
         self._hints = hints
 
     def build_initial_messages(self) -> list[dict]:
@@ -632,23 +658,39 @@ class Memory:
 
     def save_session(self, messages: list[dict]) -> None:
         """
-        保存对话历史（仅 conversation history）。
+        保存对话历史（仅 conversation history，带 HMAC 签名）。
         messages[0] 是 system message，不写入 session 文件。
         """
         history = messages[1:] if len(messages) > 1 else []
         sf = self.get_session_file()
-        sf.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        json_content = json.dumps(history, ensure_ascii=False, indent=2)
+        if self._hmac_key:
+            sig = hmac.new(self._hmac_key.encode(), json_content.encode(), "sha256").hexdigest()
+            sf.write_text(f"{sig}\n{json_content}", encoding="utf-8")
+        else:
+            sf.write_text(json_content, encoding="utf-8")
 
     def load_session(self) -> list[dict] | None:
         """
-        加载对话历史（仅 conversation history）。
+        加载对话历史（仅 conversation history，带 HMAC 校验）。
         返回的列表不含 system message，调用方需自行拼接到 build_initial_messages() 结果后。
         """
         sf = self.get_session_file()
         if not sf.exists():
             return None
         try:
-            history = json.loads(sf.read_text(encoding="utf-8"))
+            raw = sf.read_text(encoding="utf-8")
+            if self._hmac_key:
+                parts = raw.split("\n", 1)
+                if len(parts) == 2:
+                    sig, json_content = parts
+                    if hmac.new(self._hmac_key.encode(), json_content.encode(), "sha256").hexdigest() != sig:
+                        raise IntegrityError(f"session 文件被篡改：{sf}")
+                    history = json.loads(json_content)
+                else:
+                    history = json.loads(raw)  # 无签名格式，兼容旧文件
+            else:
+                history = json.loads(raw)
             if history and history[-1]["role"] == "assistant":
                 last_msg = history[-1]
                 if "tool_calls" in last_msg:
