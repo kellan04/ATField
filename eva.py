@@ -170,6 +170,7 @@ class ExitCode:
     MODEL_NOT_FOUND = 3
     TOOL_DENIED = 4
     INTEGRITY_ERROR = 5
+    PROMPT_INJECTION = 6
     UNKNOWN = 99
 
 
@@ -185,6 +186,12 @@ class IntegrityError(EVAError):
     """记忆文件被篡改"""
     def __init__(self, message: str):
         super().__init__(ExitCode.INTEGRITY_ERROR, message)
+
+
+class InputGuardError(EVAError):
+    """用户输入包含危险模式"""
+    def __init__(self, message: str):
+        super().__init__(ExitCode.PROMPT_INJECTION, message)
 
 
 class ConfigError(EVAError):
@@ -340,6 +347,153 @@ def clean_input(text: str) -> str:
     text = re.sub(r"[\ud800-\udfff]", "", text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     return text
+
+
+# ============================================================================
+# 9.5 InputGuard — Prompt 注入防火墙
+# ============================================================================
+
+class InputGuard:
+    """
+    过滤用户输入中的 Prompt 注入模式。
+
+    设计原则:
+    - FN > FP：宁可误拦也不漏过
+    - 不 crash：拦截后返回带警告的安全文本
+    - 9 类模式覆盖主流注入手法
+    """
+
+    # (pattern, category_tag)
+    _PATTERNS = [
+        # 1. Direct override (identity reassignment)
+        (
+            r"(?i)"
+            r"(system\s*prompt|you\s*are\s+now|you\s*are\s+a|"
+            r"you\s*is\s+an?\s+AI|改成|你是|现在你是|"
+            r"starting\s+from\s+now|从现在起你是|"
+            r"\[INST\]|\[/INST\]|<\|system\|>|#\s*system)",
+            "direct_override",
+        ),
+        # 2. Indirect override (context destruction)
+        (
+            r"(?i)"
+            r"(ignore\s+(all\s+)?(previous|prior|earlier)|"
+            r"disregard\s+(all\s+)?(previous|instructions)|"
+            r"forget\s+(all\s+)?(previous|instructions|everything)|"
+            r"clear\s+(all\s+)?context|忽略之前|忘记之前|"
+            r"作废之前|废弃之前|前面的作废|前面的废弃)",
+            "indirect_override",
+        ),
+        # 3. Role-play injection
+        (
+            r"(?i)"
+            r"(pretend\s+you\s+are|role\s+play\s+as|act\s+as|"
+            r"play\s+the\s+role\s+of|assume\s+the\s+identity\s+of|"
+            r"假装你是|扮演|化身|作为|假冒|假扮)",
+            "role_injection",
+        ),
+        # 4. XML/markdown hiding
+        (
+            r"(?i)"
+            r"(<[/]?system\s*>|<\s*instruction\s*>|<\s*prompt\s*>|"
+            r"```\s*system|```\s*xml|```\s*json|"
+            r"\[\[|\]\]|{{{|}}}|<\||$$\s*system)",
+            "markup_hiding",
+        ),
+        # 5. Prompt extraction
+        (
+            r"(?i)"
+            r"(reveal\s+(your|the)\s+(system\s+)?prompt|"
+            r"show\s+(your|me)\s+(system\s+)?(instructions|prompt)|"
+            r"输出你的(系统\s+)?(指令|prompt)|"
+            r"打印你的|显示你的(系统)?指令)",
+            "prompt_extraction",
+        ),
+        # 6. Known jailbreak shortcuts
+        (
+            r"(?i)"
+            r"\b(dadbot|sneakybot|anti-filter|jailbreak|"
+            r"dan\s*mode|dev\s*mode|developer\s*mode\s*enabled|"
+            r"sudo\s+mode|super\s+user\s+mode)",
+            "jailbreak_shortcut",
+        ),
+        # 7. Boundary/container markers (fake meta)
+        (
+            r"(?i)"
+            r"(###\s*SYSTEM\s*###|###\s*REAL\s*###|"
+            r"---\s*SYSTEM\s*---|<real>|<fake>|"
+            r"\[REAL\]|\[FAKE\]|\[OVERRIDE\]|\[PRIVILEGED\])",
+            "boundary_marker",
+        ),
+        # 8. Instruction prefix injection
+        (
+            r"(?i)"
+            r"^(\s*(system|admin|root|supervisor)\s*:|"
+            r"^\s*#\!\s*|^\s*<!>|^\s*\*\s*\*\s*system)",
+            "instruction_prefix",
+        ),
+        # 9. Chinese-specific override patterns
+        (
+            r"[\u4e00-\u9fff]{2,8}"
+            r"(忽略|忘记|清除|撤销|作废|废弃|覆盖)"
+            r"[\u4e00-\u9fff]{0,4}",
+            "chinese_override",
+        ),
+    ]
+
+    _COMPILED = [(re.compile(p, re.IGNORECASE), tag) for p, tag in _PATTERNS]
+
+    @classmethod
+    def sanitize(cls, text: str) -> str:
+        """
+        过滤 Prompt 注入模式，返回安全文本。
+        危险内容被替换为警告，原始文本保留。
+        """
+        if not isinstance(text, str):
+            text = str(text)
+
+        blocked: set[str] = set()
+        for compiled_re, tag in cls._COMPILED:
+            if compiled_re.search(text):
+                blocked.add(tag)
+
+        if blocked:
+            warning = f"[警告：输入被拦截，原因：{', '.join(sorted(blocked))}]"
+            cls._audit_blocked(text[:200], blocked)
+            return warning + "\n" + text
+
+        return text.strip()
+
+    @classmethod
+    def is_clean(cls, text: str) -> bool:
+        """快速检查文本是否包含危险模式"""
+        if not isinstance(text, str):
+            return True
+        for compiled_re, _ in cls._COMPILED:
+            if compiled_re.search(text):
+                return False
+        return True
+
+    @classmethod
+    def _audit_blocked(cls, text_preview: str, categories: set[str]):
+        """写入审计日志"""
+        import datetime as dt
+        import hashlib
+        audit_dir = WORKSPACE_DIR / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "time": dt.datetime.now().isoformat(),
+            "tool": "InputGuard",
+            "command_hash": hashlib.sha256(text_preview.encode()).hexdigest()[:16],
+            "exit_code": ExitCode.PROMPT_INJECTION,
+            "cap": "INPUT_GUARD",
+            "result_len": len(text_preview),
+            "denied": True,
+            "categories": sorted(categories),
+        }
+        (audit_dir / f"{dt.date.today()}.jsonl").open("a", encoding="utf-8").write(
+            json.dumps(entry, ensure_ascii=False) + "\n"
+        )
 
 
 # ============================================================================
@@ -1169,13 +1323,19 @@ class Agent:
                 if user_ask:
                     user_input = user_ask
                     print(f"[-] You: {user_input}\n")
+                    safe_input = InputGuard.sanitize(user_input)
+                    if safe_input != user_input:
+                        print("\n[!] 安全警告：已拦截可疑输入\n")
                 else:
                     print("")
                     user_input = self._read_input("[-] You: ").strip()
+                    safe_input = InputGuard.sanitize(user_input)
+                    if safe_input != user_input:
+                        print("\n[!] 安全警告：已拦截可疑输入\n")
 
                 self.ctx.messages.append({
                     "role": "user",
-                    "content": clean_input(user_input),
+                    "content": clean_input(safe_input),
                 })
                 self._single_loop()
 
@@ -1413,8 +1573,12 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
             _log("DEBUG", "OUT", {"type": "ready"})
 
         elif t == "user_message":
-            agent.ctx.messages.append({"role": "user", "content": msg["content"]})
-            _log("INFO", "USER", {"content": msg["content"][:100]})
+            raw_content = msg["content"]
+            safe_content = InputGuard.sanitize(raw_content)
+            if safe_content != raw_content:
+                _safe_print({"type": "event", "event": "content", "data": "\n[!] 安全警告：已拦截可疑输入\n"})
+            agent.ctx.messages.append({"role": "user", "content": clean_input(safe_content)})
+            _log("INFO", "USER", {"content": safe_content[:100]})
             result = agent.step()
             emit_response(result)
             if result.status == "waiting_for_tool":
