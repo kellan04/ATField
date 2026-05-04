@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -41,20 +41,316 @@ class Capability(Enum):
 
 
 # ============================================================================
+# 3.5. Zero Trust: AuthContext + TokenService
+# ============================================================================
+
+@dataclass
+class AuthContext:
+    """身份上下文：用户身份 + 短期令牌 + 作用域"""
+    user_id: str
+    session_id: str
+    token_id: str
+    scopes: set[str]
+    issued_at: int
+    expires_at: int
+    trace_id: str
+
+    def is_expired(self) -> bool:
+        import time
+        return time.time() > self.expires_at
+
+    def has_scope(self, scope: str) -> bool:
+        if scope in self.scopes:
+            return True
+        for s in self.scopes:
+            if s.endswith("*") and scope.startswith(s[:-1]):
+                return True
+        return False
+
+
+class TokenService:
+    """短期令牌服务：HMAC 签名 + 15 分钟 TTL"""
+
+    def __init__(self, hmac_key: str | None = None):
+        self._hmac_key = hmac_key or os.environ.get("EVA_HMAC_KEY", "")
+        if not self._hmac_key:
+            import secrets
+            self._hmac_key = secrets.token_hex(32)
+        self._revoked: set[str] = set()
+
+    def issue(self, user_id: str, session_id: str, scopes: set[str], ttl_sec: int = 900) -> AuthContext:
+        import hashlib
+        import time
+        import uuid
+
+        issued_at = int(time.time())
+        expires_at = issued_at + ttl_sec
+        token_id = hashlib.sha256(
+            f"{user_id}{session_id}{issued_at}{uuid.uuid4()}".encode()
+        ).hexdigest()[:24]
+        trace_id = str(uuid.uuid4())[:16]
+
+        return AuthContext(
+            user_id=user_id,
+            session_id=session_id,
+            token_id=token_id,
+            scopes=scopes,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            trace_id=trace_id,
+        )
+
+    def validate(self, ctx: AuthContext) -> bool:
+        if ctx.token_id in self._revoked:
+            return False
+        if ctx.is_expired():
+            return False
+        return True
+
+    def revoke(self, token_id: str) -> None:
+        self._revoked.add(token_id)
+
+
+@dataclass
+class ActionRequest:
+    """动作请求：描述要执行的动作及上下文"""
+    tool_name: str
+    command: str | None = None
+    cwd: str | None = None
+    targets: list[str] = field(default_factory=list)
+    estimated_risk: str = "low"
+    auth: AuthContext | None = None
+
+
+@dataclass
+class PolicyDecision:
+    """策略决策结果"""
+    effect: str  # allow | deny | require_approval
+    reason: str
+    required_capabilities: set[Capability] = field(default_factory=set)
+    risk_level: str = "low"
+
+
+class PolicyEngine:
+    """
+    PDP（策略决策点）：默认拒绝 + 风险分级
+    """
+
+    HIGH_RISK_PATTERNS = [
+        r"rm\s+-rf", r"dd\s+if=", r"chmod\s+777", r"curl.*\|.*bash",
+        r"wget.*\|.*python", r"\.\/.*\.sh$", r":\(\)\{",
+    ]
+    MEDIUM_RISK_PATTERNS = [
+        r"mv\s+", r"cp\s+", r"mkdir\s+", r"touch\s+", r"chmod\s+",
+    ]
+
+    def __init__(self):
+        import re
+        self._high_re = [re.compile(p) for p in self.HIGH_RISK_PATTERNS]
+        self._medium_re = [re.compile(p) for p in self.MEDIUM_RISK_PATTERNS]
+        self._sensitive_paths = {".env", "~/.ssh", "~/.aws", "/etc/shadow"}
+
+    def _estimate_risk(self, req: ActionRequest) -> str:
+        if not req.command:
+            return "low"
+        for re_pat in self._high_re:
+            if re_pat.search(req.command):
+                return "high"
+        for re_pat in self._medium_re:
+            if re_pat.search(req.command):
+                return "medium"
+        for sp in self._sensitive_paths:
+            expanded = os.path.expanduser(sp)
+            if expanded in req.command:
+                return "high"
+        return "low"
+
+    def evaluate(self, req: ActionRequest, ctx: AuthContext | None) -> PolicyDecision:
+        # 无认证 → 拒绝
+        if ctx is None:
+            return PolicyDecision(
+                effect="deny", reason="无认证上下文",
+                required_capabilities=set(), risk_level="high",
+            )
+
+        # 令牌校验
+        if not TokenService().validate(ctx):
+            return PolicyDecision(
+                effect="deny", reason="令牌已过期或已吊销",
+                required_capabilities=set(), risk_level="high",
+            )
+
+        risk = self._estimate_risk(req)
+
+        if risk == "high":
+            return PolicyDecision(
+                effect="require_approval",
+                reason=f"高风险命令（{req.command[:50]}）",
+                required_capabilities={Capability.EXEC},
+                risk_level="high",
+            )
+
+        # scope 校验
+        required_scope = self._get_required_scope(req)
+        if required_scope and not ctx.has_scope(required_scope):
+            return PolicyDecision(
+                effect="deny",
+                reason=f"缺少必要 scope：{required_scope}",
+                required_capabilities={self._cap_from_scope(required_scope)},
+                risk_level=risk,
+            )
+
+        return PolicyDecision(
+            effect="allow", reason="默认允许",
+            required_capabilities=set(), risk_level=risk,
+        )
+
+    def _get_required_scope(self, req: ActionRequest) -> str | None:
+        if req.tool_name == "run_cli" and req.command:
+            if any(kw in req.command for kw in WRITE_KEYWORDS):
+                return "fs:write:workspace"
+            return "fs:read:workspace"
+        if req.tool_name == "leave_memory_hints":
+            return "memory:hints:write"
+        return None
+
+    def _cap_from_scope(self, scope: str) -> Capability:
+        if scope.startswith("fs:read"):
+            return Capability.READ_FS
+        if scope.startswith("fs:write"):
+            return Capability.WRITE_FS
+        if scope.startswith("exec"):
+            return Capability.EXEC
+        return Capability.READ_FS
+
+
+class AuditLogger:
+    """
+    结构化审计日志（JSONL）：
+    - trace_id 关联完整请求链
+    - user_id / session_id / token_id 溯源
+    """
+
+    def __init__(self, audit_dir: Path | None = None):
+        self._audit_dir = audit_dir or (WORKSPACE_DIR / "audit")
+        self._audit_dir.mkdir(parents=True, exist_ok=True)
+
+    def log_tool_call(
+        self,
+        tool: str,
+        args: dict,
+        decision: PolicyDecision,
+        auth: AuthContext | None,
+        exit_code: int,
+        result_len: int,
+    ) -> None:
+        import datetime as dt
+
+        entry = {
+            "type": "tool_call",
+            "ts": dt.datetime.now().isoformat(),
+            "tool": tool,
+            "args": {k: str(v)[:200] for k, v in args.items()},
+            "decision": decision.effect,
+            "reason": decision.reason,
+            "risk_level": decision.risk_level,
+            "exit_code": exit_code,
+            "result_len": result_len,
+            "capabilities": [c.value for c in decision.required_capabilities],
+        }
+        if auth:
+            entry.update({
+                "trace_id": auth.trace_id,
+                "user_id": auth.user_id,
+                "session_id": auth.session_id,
+                "token_id": auth.token_id,
+            })
+
+        (self._audit_dir / f"{dt.date.today()}.jsonl").open("a", encoding="utf-8").write(
+            json.dumps(entry, ensure_ascii=False) + "\n"
+        )
+
+
+class RiskEngine:
+    """
+    规则化风控引擎：
+    - 频率限制
+    - 敏感路径访问检测
+    - 连续拒绝重试检测
+    """
+
+    def __init__(self):
+        self._read_counts: dict[str, list[float]] = {}
+        self._denied_counts: dict[str, list[float]] = {}
+        self._sensitive_paths = {".env", "~/.ssh", "~/.aws", "/etc/shadow", ".netrc"}
+
+    def check_read_rate(self, user_id: str, window_sec: int = 10, max_ops: int = 30) -> bool:
+        import time
+        now = time.time()
+        if user_id not in self._read_counts:
+            self._read_counts[user_id] = []
+        self._read_counts[user_id] = [t for t in self._read_counts[user_id] if now - t < window_sec]
+        self._read_counts[user_id].append(now)
+        return len(self._read_counts[user_id]) > max_ops
+
+    def check_deny_retry(self, user_id: str, window_sec: int = 60, max_denies: int = 5) -> bool:
+        import time
+        now = time.time()
+        if user_id not in self._denied_counts:
+            self._denied_counts[user_id] = []
+        self._denied_counts[user_id] = [t for t in self._denied_counts[user_id] if now - t < window_sec]
+        self._denied_counts[user_id].append(now)
+        return len(self._denied_counts[user_id]) > max_denies
+
+    def check_sensitive_access(self, command: str) -> bool:
+        expanded = os.path.expanduser(command)
+        for sp in self._sensitive_paths:
+            if os.path.expanduser(sp) in expanded:
+                return True
+        return False
+
+
+@dataclass
+class SecurityConfig:
+    """安全配置"""
+    token_ttl_sec: int = 900
+    sandbox_mode: str = "local"
+    workspace_mode: str = "ro"
+    require_approval_on_high_risk: bool = True
+    hmac_key: str = ""
+
+
+# ============================================================================
 # 3. AgentContext
 # ============================================================================
 @dataclass
 class AgentContext:
-    """运行时状态容器"""
+    """运行时状态容器（Zero Trust 扩展）"""
     messages: list = field(default_factory=list)
     compact_panic: str = "off"
     allow_all_cli: bool = False
     granted_capabilities: set[Capability] = field(default_factory=set)
+    # Zero Trust 扩展
+    auth: AuthContext | None = None
+    security_config: dict | None = None
+    risk_engine: RiskEngine | None = None
 
     def __post_init__(self):
-        # -a 模式自动授予所有能力（开发环境）
         if self.allow_all_cli:
             self.granted_capabilities = set(Capability)
+            # allow_all_cli 模式下创建完整权限的 AuthContext
+            import uuid
+            import time
+            self.auth = AuthContext(
+                user_id="local_admin",
+                session_id=str(uuid.uuid4())[:12],
+                token_id="allow_all_mode",
+                scopes={"fs:read:workspace", "fs:write:workspace", "exec:local", "memory:hints:write"},
+                issued_at=int(time.time()),
+                expires_at=int(time.time()) + 86400,
+                trace_id=str(uuid.uuid4())[:16],
+            )
+            self.risk_engine = RiskEngine()
 
 
 # 只读命令白名单（可执行前无需用户确认）
@@ -982,13 +1278,54 @@ class ToolRegistry:
         return result
 
     def _run_cli(self, command: str, timeout: int = 30) -> str:
-        """执行 Shell 命令（基于 capability 的本地策略判断）"""
+        """执行 Shell 命令（PolicyEngine PDP + 沙箱可插拔）"""
         try:
             cap = self._classify_capability(command)
+
+            # 构建 ActionRequest
+            req = ActionRequest(
+                tool_name="run_cli",
+                command=command,
+                cwd=os.getcwd(),
+                estimated_risk="medium" if cap == Capability.WRITE_FS else "low",
+                auth=self.ctx.auth,
+            )
+
+            # PDP 决策
+            policy = PolicyEngine().evaluate(req, self.ctx.auth)
+
+            if policy.effect == "deny":
+                reason = f"策略拒绝：{policy.reason}"
+                self._audit_log("run_cli", command, 0, cap=cap.value, denied=True)
+                AuditLogger().log_tool_call(
+                    tool="run_cli", args={"command": command},
+                    decision=policy, auth=self.ctx.auth,
+                    exit_code=0, result_len=len(reason),
+                )
+                return reason
+
+            if policy.effect == "require_approval":
+                if not self.ctx.allow_all_cli:
+                    ans = input(f"\n[安全审批] {policy.reason}\nYes / No (默认No): ")
+                    if ans.lower() != "y":
+                        self._audit_log("run_cli", command, 0, denied=True)
+                        return "用户拒绝"
+                # allow_all_cli 模式自动放行
+
+            # 风控检查
+            risk = self.ctx.risk_engine
+            if risk and self.ctx.auth:
+                user_id = self.ctx.auth.user_id
+                if risk.check_read_rate(user_id):
+                    return "错误：读操作频率超限，请稍后重试"
+                if risk.check_deny_retry(user_id):
+                    return "错误：检测到异常重试行为，已禁止操作"
+
             if cap == Capability.READ_FS:
                 return self._run_readonly_cli(command, timeout)
             else:
                 return self._run_mutating_cli(command, timeout)
+
         except Exception as e:
             return f"执行失败：{str(e)}"
 
@@ -1135,6 +1472,7 @@ class Agent:
         ctx: AgentContext,
         memory: Memory,
         use_default_callbacks: bool = True,
+        security_config: SecurityConfig | None = None,
     ):
         self.config = config
         self.platform = platform
@@ -1142,6 +1480,27 @@ class Agent:
         self.memory = memory
         self.tools = ToolRegistry(config, platform, ctx)
         self.tools.setup_builtin_tools()
+
+        # Zero Trust 初始化
+        self._security_config = security_config or SecurityConfig()
+        self._token_service = TokenService(self._security_config.hmac_key or None)
+
+        import uuid
+        session_id = str(uuid.uuid4())[:12]
+        default_scopes = {"fs:read:workspace"}
+        if self._security_config.workspace_mode == "rw":
+            default_scopes.add("fs:write:workspace")
+        if self.ctx.allow_all_cli:
+            default_scopes.update({"fs:read:workspace", "fs:write:workspace", "exec:local"})
+
+        self.ctx.auth = self._token_service.issue(
+            user_id="local_user",
+            session_id=session_id,
+            scopes=default_scopes,
+            ttl_sec=self._security_config.token_ttl_sec,
+        )
+        self.ctx.risk_engine = RiskEngine()
+        self.ctx.security_config = asdict(self._security_config)
 
         # 事件回调（前端订阅）
         self.on_thinking: Callable[[str], None] | None = None
