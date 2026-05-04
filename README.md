@@ -178,7 +178,7 @@ poetry run ruff check eva.py eva_tui.py
 | Audit logging | ✅ Implemented |
 | Offline mode (no import network) | ✅ Implemented |
 | Sandbox execution (firejail/sandbox-exec) | ⬜ Planned |
-| Prompt injection firewall (InputGuard) | ⬜ Planned |
+| Prompt injection firewall (InputGuard) | ✅ Implemented |
 | HMAC-signed memory (tamper-proof) | ✅ Implemented |
 
 See [todo/hardening_plan.md](todo/hardening_plan.md) for detailed design specs.
