@@ -177,7 +177,7 @@ poetry run ruff check eva.py eva_tui.py
 | Read-only command whitelist | ✅ Implemented |
 | Audit logging | ✅ Implemented |
 | Offline mode (no import network) | ✅ Implemented |
-| Sandbox execution (firejail/sandbox-exec) | ⬜ Planned |
+| Sandbox execution (firejail/sandbox-exec) | ✅ Implemented |
 | Prompt injection firewall (InputGuard) | ✅ Implemented |
 | HMAC-signed memory (tamper-proof) | ✅ Implemented |
 
