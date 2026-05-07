@@ -27,6 +27,8 @@ from textual.widgets import Input, Static  # noqa: F401
 # 工具函数
 # ============================================================================
 
+MAX_RESULT_LEN = 500
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -77,9 +79,16 @@ class EvaBackend:
 
     def _reader_loop(self, on_message: Callable[[dict], None]) -> None:
         for line in self.proc.stdout:
-            msg = json.loads(line.strip())
-            self._log("IN", msg)
-            on_message(msg)
+            try:
+                msg = json.loads(line.strip())
+            except json.JSONDecodeError:
+                self._log("IN", {"error": "json decode failed", "raw": line[:100]})
+                continue
+            try:
+                self._log("IN", msg)
+                on_message(msg)
+            except Exception as e:
+                self._log("IN", {"error": str(e)})
 
     def start_reader(self, on_message: Callable[[dict], None]) -> None:
         t = Thread(target=self._reader_loop, args=(on_message,), daemon=True)
@@ -206,6 +215,7 @@ class EVATUI(App):
         self._content_buf: list[str] = []
         self._thinking_widget: Static | None = None
         self._tool_widget: Static | None = None
+        self._console = Console(file=StringIO(), width=120, force_terminal=False)
 
     def compose(self) -> ComposeResult:
         header = "EVA TUI  |  Backend: eva.py --tui"
@@ -261,10 +271,25 @@ class EVATUI(App):
         elif msg_type == "session_saved":
             pass  # save 成功，无需 UI 反馈
 
+    def _truncate_at_word_boundary(self, text: str, limit: int = MAX_RESULT_LEN) -> str:
+        """在单词边界截断文本，避免硬截断打断单词"""
+        if len(text) <= limit:
+            return text
+        truncated = text[:limit]
+        last_space = truncated.rfind(" ")
+        if last_space > limit * 0.7:
+            return truncated[:last_space]
+        return truncated
+
     def _render_md(self, text: str) -> Text:
         """将 Markdown 文本渲染为 Rich Text"""
         clean = strip_ansi(text)
-        console = Console(file=StringIO(), width=120, force_terminal=False)
+        console = getattr(self, "_console", None)
+        if console is None:
+            console = Console(file=StringIO(), width=120, force_terminal=False)
+        else:
+            console.file.truncate(0)
+            console.file.seek(0)
         console.print(RichMarkdown(clean))
         rendered = console.file.getvalue()
         return Text.from_ansi(rendered)
@@ -315,7 +340,7 @@ class EVATUI(App):
             self._tool_widget = None
         # 渲染工具结果（先清理 ANSI，再截断）
         clean = strip_ansi(result)
-        display = clean[:500] + ("... 省略" if len(clean) > 500 else "")
+        display = self._truncate_at_word_boundary(clean) + ("... 省略" if len(clean) > MAX_RESULT_LEN else "")
         content = self._render_md(display)
         label = Text(f"🔧 工具结果 [{id[:12]}...]\n", style="bold #b8a9c9")
         scroll.mount(Static(
@@ -374,19 +399,28 @@ class EVATUI(App):
         user_text = event.value.strip()
         if not user_text:
             return
+        # 清空后立即发送（非事务性，但保证UI先清理）
+        self._thinking_buf.clear()
+        self._content_buf.clear()
+        self._thinking_widget = None
+        self._tool_widget = None
+        self._clear_conv_widgets()
         event.input.clear()
-
         self._append_user(user_text)
         self.backend.send({"type": "user_message", "content": user_text})
-        self._thinking_buf = []
-        self._content_buf = []
+
+    def action_clear_conv(self) -> None:
+        self._clear_conv_widgets()
         self._thinking_widget = None
         self._tool_widget = None
 
-    def action_clear_conv(self) -> None:
-        scroll = self.query_one("#conv_scroll", ScrollableContainer)
-        for widget in scroll.children:
-            widget.remove()
+    def _clear_conv_widgets(self) -> None:
+        try:
+            scroll = self.query_one("#conv_scroll", ScrollableContainer)
+            for widget in scroll.children:
+                widget.remove()
+        except Exception:
+            pass
 
     def action_toggle_debug(self) -> None:
         """切换 debug 模式"""
