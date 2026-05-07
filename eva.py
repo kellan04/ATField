@@ -339,8 +339,8 @@ class AgentContext:
         if self.allow_all_cli:
             self.granted_capabilities = set(Capability)
             # allow_all_cli 模式下创建完整权限的 AuthContext
-            import uuid
             import time
+            import uuid
             self.auth = AuthContext(
                 user_id="local_admin",
                 session_id=str(uuid.uuid4())[:12],
@@ -1217,20 +1217,18 @@ class ToolRegistry:
         return Capability.READ_FS
 
     def _execute_direct(self, command: str, timeout: int) -> str:
-        """直接执行命令（无沙箱）。Phase 3 替换为 sandbox.run()"""
-        result = subprocess.run(
-            [self.platform.shell, self.platform.shell_flag, command],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            cwd=os.getcwd(),
-            timeout=timeout,
-            shell=False,
-        )
-        output = f"Exit code: {result.returncode}\n{result.stdout}"
-        if result.stderr:
-            output += f"\nSTDERR:\n{result.stderr}"
-        return output.strip() or "(no output)"
+        """执行命令（通过沙箱）"""
+        runner = getattr(self, "_sandbox_runner", None)
+        if runner is None:
+            import shutil
+            sandbox_mode = os.environ.get("EVA_SANDBOX_MODE", "auto")
+            if sandbox_mode == "local":
+                runner = LocalRunner(self.platform)
+            elif sandbox_mode == "docker" or (sandbox_mode == "auto" and shutil.which("docker")):
+                runner = DockerRunner(".", "ro")
+            else:
+                runner = LocalRunner(self.platform)
+        return runner.run(command, timeout, os.getcwd(), "rw")
 
     def _audit_log(self, tool: str, command: str, exit_code: int,
                    cap: str | None = None, result_len: int | None = None,
@@ -1254,9 +1252,8 @@ class ToolRegistry:
 
     def _run_readonly_cli(self, command: str, timeout: int) -> str:
         """白名单只读命令，直接执行"""
-        # 白名单二次确认（比关键词更严格）
         first_word = command.strip().split()[0] if command.strip() else ""
-        if first_word not in READONLY_KEYWORDS and command.strip().split()[0] != "echo":
+        if first_word not in READONLY_KEYWORDS and first_word != "echo":
             return f"只读白名单不包括此命令（{first_word}），拒绝执行"
         result = self._execute_direct(command, timeout)
         cap = self._classify_capability(command)
@@ -1323,8 +1320,7 @@ class ToolRegistry:
 
             if cap == Capability.READ_FS:
                 return self._run_readonly_cli(command, timeout)
-            else:
-                return self._run_mutating_cli(command, timeout)
+            return self._run_mutating_cli(command, timeout)
 
         except Exception as e:
             return f"执行失败：{str(e)}"
@@ -1393,7 +1389,6 @@ class ToolRegistry:
         """执行工具（统一入口，默认拒绝 + capability 校验）"""
         if name not in self._handlers:
             return f"未知工具：{name}"
-        # 检查能力授权（默认拒绝）
         required = self._tool_capabilities.get(name, set())
         if required:
             denied = [c for c in required if c not in self.ctx.granted_capabilities]
@@ -1434,6 +1429,114 @@ class ToolRegistry:
         }
         self.register(run_cli_schema, self._run_cli, {Capability.EXEC})
         self.register(memory_hints_schema, self._leave_memory_hints, {Capability.MEMORY})
+
+
+# ============================================================================
+# 14.5. SandboxRunner: Execution Isolation
+# ============================================================================
+
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class SandboxRunner(Protocol):
+    def run(self, command: str, timeout: int, workspace_path: str, mode: str) -> str: ...
+
+
+class LocalRunner:
+    def __init__(self, platform):
+        self.platform = platform
+
+    def run(self, command: str, timeout: int, workspace_path: str = ".", mode: str = "rw") -> str:
+        result = subprocess.run(
+            [self.platform.shell, self.platform.shell_flag, command],
+            capture_output=True, text=True, errors="replace",
+            cwd=os.getcwd(), timeout=timeout, shell=False,
+        )
+        output = f"Exit code: {result.returncode}\n{result.stdout}"
+        if result.stderr:
+            output += f"\nSTDERR:\n{result.stderr}"
+        return output.strip() or "(no output)"
+
+
+class DockerRunner:
+    DOCKER_IMAGE = "python:3.11-slim"
+    DOCKER_FLAGS = [
+        "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+        "--pids-limit=100", "--memory=512m", "--cpus=1.0",
+        "--network=none", "--user=1000:1000", "--rm",
+    ]
+
+    def __init__(self, workspace_path: str = ".", mode: str = "ro"):
+        self.workspace_path = workspace_path
+        self.mode = mode
+
+    def run(self, command: str, timeout: int, workspace_path: str = ".", mode: str = "ro") -> str:
+        import shutil
+        docker_path = shutil.which("docker")
+        if not docker_path:
+            return "错误：Docker 未安装或不在 PATH 中"
+        abs_ws = str(Path(workspace_path).resolve())
+        mount_mode = "ro" if mode == "ro" else "rw"
+        mount_flag = f"type=bind,source={abs_ws},destination=/workspace,readonly={mount_mode!r}"
+        cmd = [docker_path, "run", "--interactive", *self.DOCKER_FLAGS,
+               "-v", mount_flag, self.DOCKER_IMAGE, "sh", "-c", command]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    errors="replace", timeout=timeout)
+            output = f"Exit code: {result.returncode}\n{result.stdout}"
+            if result.stderr:
+                output += f"\nSTDERR:\n{result.stderr}"
+            return output.strip() or "(no output)"
+        except subprocess.TimeoutExpired:
+            return f"错误：命令执行超时（{timeout}秒）"
+        except Exception as e:
+            return f"错误：Docker 执行失败：{str(e)}"
+
+
+class SandboxExecRunner:
+    SANDBOX_PROFILE = """
+(version 1)
+(allow default)
+(deny file-write* except (literal "/tmp"))
+(deny network*)
+"""
+
+    def run(self, command: str, timeout: int, workspace_path: str = ".", mode: str = "ro") -> str:
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sb", delete=False) as f:
+            f.write(self.SANDBOX_PROFILE)
+            profile_path = f.name
+        try:
+            result = subprocess.run(
+                ["sandbox-exec", "-f", profile_path, SHELL, SHELL_FLAG, command],
+                capture_output=True, text=True, errors="replace",
+                cwd=workspace_path, timeout=timeout,
+            )
+            output = f"Exit code: {result.returncode}\n{result.stdout}"
+            if result.stderr:
+                output += f"\nSTDERR:\n{result.stderr}"
+            return output.strip() or "(no output)"
+        finally:
+            Path(profile_path).unlink(missing_ok=True)
+
+
+class SandboxFactory:
+    """按平台/配置选择沙箱执行器"""
+
+    @staticmethod
+    def create(platform_obj, mode: str = "auto") -> SandboxRunner:
+        if mode == "local":
+            return LocalRunner(platform_obj)
+        if mode == "sandbox-exec":
+            return SandboxExecRunner()
+        if mode == "docker":
+            return DockerRunner(".", "ro")
+
+        import shutil
+        if shutil.which("docker"):
+            return DockerRunner(".", "ro")
+        return LocalRunner(platform_obj)
 
 
 # ============================================================================

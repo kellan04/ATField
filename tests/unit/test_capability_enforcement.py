@@ -38,7 +38,9 @@ class TestCapabilityGate:
         registry = ToolRegistry(mock_config, mock_platform, ctx)
         registry.setup_builtin_tools()
         # run_cli 有 Capability.EXEC，已授权
-        result = registry.execute("run_cli", {"command": "echo ok", "timeout": 5})
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok\n", stderr="")
+            result = registry.execute("run_cli", {"command": "echo ok", "timeout": 5})
         assert "ok" in result
 
     def test_capability_denied_without_grant(self, mock_config, mock_platform):

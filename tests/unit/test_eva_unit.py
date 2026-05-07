@@ -278,7 +278,7 @@ class TestToolRegistry:
         registry.setup_builtin_tools()
 
         result = registry.execute("run_cli", {"command": "sleep 100", "timeout": 1})
-        assert "TimeoutExpired" in result or "timed out" in result
+        assert "超时" in result or "timed out" in result
 
 
 # ============================================================================
