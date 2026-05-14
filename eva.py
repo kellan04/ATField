@@ -2082,7 +2082,10 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
             execute_tools_and_resume()
 
     for line in sys.stdin:
-        msg = json.loads(line.strip())
+        line = line.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
         t = msg.get("type")
         _log("DEBUG", "IN", msg)
 

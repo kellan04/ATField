@@ -153,13 +153,14 @@ class EVATUI(App):
         height: 100%;
         background: #0f0f1a;
         scrollbar-size: 1 1;
-        scrollbar-color: #7ee8fa;
+        scrollbar-color: #7ee8fa #1a1a2e;
         padding: 1;
     }
 
     #input_area {
         dock: bottom;
-        height: 3;
+        height: auto;
+        min-height: 3;
         background: #1a1a2e;
         border-top: tall solid #7ee8fa;
     }
@@ -178,7 +179,7 @@ class EVATUI(App):
 
     .header {
         dock: top;
-        height: 3;
+        height: 1.5em;
         background: #1a1a2e;
         content-align: center middle;
         color: #7ee8fa;
