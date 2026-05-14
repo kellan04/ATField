@@ -67,6 +67,25 @@ class AuthContext:
                 return True
         return False
 
+    @property
+    def scopes_as_capabilities(self) -> set:
+        """将 scope 字符串映射为 Capability 枚举集合"""
+        caps = set()
+        for scope in self.scopes:
+            if scope.startswith("fs:read"):
+                caps.add(Capability.READ_FS)
+            elif scope.startswith("fs:write"):
+                caps.add(Capability.WRITE_FS)
+            elif scope == "exec" or scope.startswith("exec"):
+                caps.add(Capability.EXEC)
+            elif scope.startswith("memory"):
+                caps.add(Capability.MEMORY)
+            elif scope == "network":
+                caps.add(Capability.NETWORK)
+            elif scope == "session":
+                caps.add(Capability.SESSION)
+        return caps
+
 
 class TokenService:
     """短期令牌服务：HMAC 签名 + 15 分钟 TTL，单例模式"""
@@ -203,38 +222,32 @@ class PolicyEngine:
                 risk_level="high",
             )
 
-        # scope 校验
-        required_scope = self._get_required_scope(req)
-        if required_scope and not ctx.has_scope(required_scope):
-            return PolicyDecision(
-                effect="deny",
-                reason=f"缺少必要 scope：{required_scope}",
-                required_capabilities={self._cap_from_scope(required_scope)},
-                risk_level=risk,
-            )
+        # capability 校验
+        required_caps = self._get_required_capabilities(req)
+        if required_caps:
+            ctx_caps = ctx.scopes_as_capabilities
+            missing = required_caps - ctx_caps
+            if missing:
+                return PolicyDecision(
+                    effect="deny",
+                    reason=f"缺少必要 capability：{[c.value for c in missing]}",
+                    required_capabilities=required_caps,
+                    risk_level=risk,
+                )
 
         return PolicyDecision(
             effect="allow", reason="默认允许",
             required_capabilities=set(), risk_level=risk,
         )
 
-    def _get_required_scope(self, req: ActionRequest) -> str | None:
+    def _get_required_capabilities(self, req: ActionRequest) -> set:
         if req.tool_name == "run_cli" and req.command:
             if any(kw in req.command for kw in WRITE_KEYWORDS):
-                return "fs:write:workspace"
-            return "fs:read:workspace"
+                return {Capability.WRITE_FS, Capability.EXEC}
+            return {Capability.READ_FS}
         if req.tool_name == "leave_memory_hints":
-            return "memory:hints:write"
-        return None
-
-    def _cap_from_scope(self, scope: str) -> Capability:
-        if scope.startswith("fs:read"):
-            return Capability.READ_FS
-        if scope.startswith("fs:write"):
-            return Capability.WRITE_FS
-        if scope.startswith("exec"):
-            return Capability.EXEC
-        return Capability.READ_FS
+            return {Capability.MEMORY}
+        return set()
 
 
 class AuditLogger:
