@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import traceback
+import threading
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -252,14 +253,46 @@ class PolicyEngine:
 
 class AuditLogger:
     """
-    结构化审计日志（JSONL）：
-    - trace_id 关联完整请求链
-    - user_id / session_id / token_id 溯源
+    异步审计日志写入器（后台线程 + 队列）：
+    - 单例模式，通过 get_instance() 访问
+    - log_tool_call 非阻塞入队，后台线程异步写文件
+    - JSONL 每行独立，无需文件锁
     """
 
+    _instance: "AuditLogger | None" = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls) -> "AuditLogger":
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
     def __init__(self, audit_dir: Path | None = None):
+        import queue
         self._audit_dir = audit_dir or (WORKSPACE_DIR / "audit")
         self._audit_dir.mkdir(parents=True, exist_ok=True)
+        self._queue: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._thread.start()
+
+    def _writer_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                entry = self._queue.get(timeout=0.5)
+                self._write_entry(entry)
+                self._queue.task_done()
+            except queue.Empty:
+                continue
+
+    def _write_entry(self, entry: dict) -> None:
+        date = entry.pop("_date")
+        (self._audit_dir / f"{date}.jsonl").open("a", encoding="utf-8").write(
+            json.dumps(entry, ensure_ascii=False) + "\n"
+        )
 
     def log_tool_call(
         self,
@@ -273,6 +306,7 @@ class AuditLogger:
         import datetime as dt
 
         entry = {
+            "_date": dt.date.today().isoformat(),
             "type": "tool_call",
             "ts": dt.datetime.now().isoformat(),
             "tool": tool,
@@ -292,9 +326,7 @@ class AuditLogger:
                 "token_id": auth.token_id,
             })
 
-        (self._audit_dir / f"{dt.date.today()}.jsonl").open("a", encoding="utf-8").write(
-            json.dumps(entry, ensure_ascii=False) + "\n"
-        )
+        self._queue.put_nowait(entry)
 
 
 class RiskEngine:
@@ -1320,7 +1352,7 @@ class ToolRegistry:
             if policy.effect == "deny":
                 reason = f"策略拒绝：{policy.reason}"
                 self._audit_log("run_cli", command, 0, cap=cap.value, denied=True)
-                AuditLogger().log_tool_call(
+                AuditLogger.get_instance().log_tool_call(
                     tool="run_cli", args={"command": command},
                     decision=policy, auth=self.ctx.auth,
                     exit_code=0, result_len=len(reason),
