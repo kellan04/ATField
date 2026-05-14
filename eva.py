@@ -69,26 +69,38 @@ class AuthContext:
 
 
 class TokenService:
-    """短期令牌服务：HMAC 签名 + 15 分钟 TTL"""
+    """短期令牌服务：HMAC 签名 + 15 分钟 TTL，单例模式"""
+
+    _instance: "TokenService | None" = None
+
+    @classmethod
+    def get_instance(cls) -> "TokenService":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
     def __init__(self, hmac_key: str | None = None):
+        import secrets
         self._hmac_key = hmac_key or os.environ.get("EVA_HMAC_KEY", "")
         if not self._hmac_key:
-            import secrets
             self._hmac_key = secrets.token_hex(32)
         self._revoked: set[str] = set()
+        self._revoked_file = WORKSPACE_DIR / "token_revocations.json"
+        self._load_revoked()
+
+    def _load_revoked(self) -> None:
+        if self._revoked_file.exists():
+            self._revoked = set(json.loads(self._revoked_file.read_text()))
 
     def issue(self, user_id: str, session_id: str, scopes: set[str], ttl_sec: int = 900) -> AuthContext:
         import hashlib
         import time
-        import uuid
+        import secrets
 
         issued_at = int(time.time())
         expires_at = issued_at + ttl_sec
-        token_id = hashlib.sha256(
-            f"{user_id}{session_id}{issued_at}{uuid.uuid4()}".encode()
-        ).hexdigest()[:24]
-        trace_id = str(uuid.uuid4())[:16]
+        token_id = secrets.token_hex(24)
+        trace_id = secrets.token_hex(8)
 
         return AuthContext(
             user_id=user_id,
@@ -109,6 +121,7 @@ class TokenService:
 
     def revoke(self, token_id: str) -> None:
         self._revoked.add(token_id)
+        self._revoked_file.write_text(json.dumps(list(self._revoked)))
 
 
 @dataclass
@@ -174,7 +187,7 @@ class PolicyEngine:
             )
 
         # 令牌校验
-        if not TokenService().validate(ctx):
+        if not TokenService.get_instance().validate(ctx):
             return PolicyDecision(
                 effect="deny", reason="令牌已过期或已吊销",
                 required_capabilities=set(), risk_level="high",
