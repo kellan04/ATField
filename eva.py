@@ -1330,6 +1330,8 @@ class ToolRegistry:
                     return "错误：读操作频率超限，请稍后重试"
                 if risk.check_deny_retry(user_id):
                     return "错误：检测到异常重试行为，已禁止操作"
+                if risk.check_sensitive_access(command):
+                    return "错误：禁止访问敏感路径"
 
             if cap == Capability.READ_FS:
                 return self._run_readonly_cli(command, timeout)
