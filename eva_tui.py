@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from io import StringIO
 from pathlib import Path
 from threading import Thread
@@ -216,6 +217,9 @@ class EVATUI(App):
         self._thinking_widget: Static | None = None
         self._tool_widget: Static | None = None
         self._console = Console(file=StringIO(), width=120, force_terminal=False)
+        self._content_pending = False
+        self._content_flush_time = 0.0
+        self._flush_interval = 0.05  # 50ms
 
     def compose(self) -> ComposeResult:
         header = "EVA TUI  |  Backend: eva.py --tui"
@@ -247,6 +251,7 @@ class EVATUI(App):
             elif event == "content":
                 self._finalize_thinking()
                 self._content_buf.append(msg.get("data", ""))
+                self._schedule_content_flush()
             elif event == "tool_start":
                 self._thinking_buf.clear()
                 self._finalize_thinking()
@@ -373,6 +378,42 @@ class EVATUI(App):
         if self._thinking_widget:
             self._thinking_widget.remove()
             self._thinking_widget = None
+
+    def _schedule_content_flush(self) -> None:
+        """节流：避免每字一次 DOM 操作，改为定时批量渲染"""
+        if self._content_pending:
+            return
+        self._content_pending = True
+        self._content_flush_time = time.time() + self._flush_interval
+        try:
+            self.call_from_thread(self._flush_content)
+        except RuntimeError:
+            # App not running (test context) — flush immediately
+            self._flush_content()
+
+    def _flush_content(self) -> None:
+        """定时批量渲染累积的 content buffer"""
+        now = time.time()
+        if now < self._content_flush_time:
+            # 还没到时间，重新调度
+            remaining = self._content_flush_time - now
+            self._content_pending = False
+            def reschedule():
+                time.sleep(remaining)
+                try:
+                    self.call_from_thread(self._schedule_content_flush)
+                except RuntimeError:
+                    pass
+            t = Thread(target=reschedule, daemon=True)
+            t.start()
+            return
+        if not self._content_buf:
+            self._content_pending = False
+            return
+        full = "".join(self._content_buf)
+        self._content_buf.clear()
+        self._content_pending = False
+        self._append_conv("assistant", full)
 
     def _finalize_response(self, msg: dict) -> None:
         """处理后端最终响应"""
