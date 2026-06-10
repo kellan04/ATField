@@ -102,6 +102,37 @@ class EvaBackend:
 # ============================================================================
 # Textual TUI 应用
 # ============================================================================
+# Design Tokens
+# ============================================================================
+
+ROLE_COLORS: dict[str, str] = {
+    "user": "#7ee8fa",
+    "assistant": "#e8d5b7",
+    "tool": "#b8a9c9",
+    "system": "#90EE90",
+    "thinking": "#555555",
+}
+
+ROLE_ICONS: dict[str, str] = {
+    "user": "👤",
+    "assistant": "🤖",
+    "tool": "🔧",
+    "system": "⚙️",
+    "thinking": "💭",
+}
+
+ROLE_LABELS: dict[str, str] = {
+    "user": "You",
+    "assistant": "EVA",
+}
+
+PLACEHOLDER_TEXT: str = "输入你的问题，按 Enter 发送..."
+INIT_MESSAGE: str = "你好，介绍一下你自己"
+
+
+# ============================================================================
+# MessageBubble
+# ============================================================================
 
 class MessageBubble(Static):
     """单条消息气泡（支持 Markdown/JSON）"""
@@ -112,31 +143,11 @@ class MessageBubble(Static):
         super().__init__(**kwargs)
 
     def render(self) -> Text:
-        color = {
-            "user": "#7ee8fa",
-            "assistant": "#e8d5b7",
-            "tool": "#b8a9c9",
-            "system": "#90EE90",
-            "thinking": "#555555",
-        }.get(self.role, "#ffffff")
-
-        icon = {
-            "user": "👤",
-            "assistant": "🤖",
-            "tool": "🔧",
-            "system": "⚙️",
-            "thinking": "💭",
-        }.get(self.role, "💬")
-
-        role_label = "You" if self.role == "user" else "EVA" if self.role == "assistant" else self.role.title()
+        color = ROLE_COLORS.get(self.role, "#ffffff")
+        icon = ROLE_ICONS.get(self.role, "💬")
+        role_label = ROLE_LABELS.get(self.role, self.role.title())
         label = f"{icon} {role_label}"
-
-        if self.role == "thinking":
-            return Text(f"{label}\n{self.body}", style=f"bold {color}")
-        elif self.role == "tool":
-            return Text(f"{label}\n{self.body}", style=f"bold {color}")
-        else:
-            return Text(f"{label}\n{self.body}", style=f"bold {color}")
+        return Text(f"{label}\n{self.body}", style=f"bold {color}")
 
 
 class EVATUI(App):
@@ -179,7 +190,7 @@ class EVATUI(App):
 
     .header {
         dock: top;
-        height: 1.5em;
+        height: 2;
         background: #1a1a2e;
         content-align: center middle;
         color: #7ee8fa;
@@ -228,7 +239,7 @@ class EVATUI(App):
             header += "  [DEBUG]"
         yield Static(header, classes="header")
         yield ScrollableContainer(id="conv_scroll")
-        yield Input(placeholder="输入你的问题，按 Enter 发送...", id="user_input")
+        yield Input(placeholder=PLACEHOLDER_TEXT, id="user_input")
 
     def on_mount(self) -> None:
         self.backend.start_reader(self._on_backend_message)
@@ -240,7 +251,7 @@ class EVATUI(App):
 
         if msg_type == "ready":
             # 后端就绪后，发送初始消息
-            self.backend.send({"type": "user_message", "content": "你好，介绍一下你自己"})
+            self.backend.send({"type": "user_message", "content": INIT_MESSAGE})
 
         elif msg_type == "event":
             event = msg.get("event")
@@ -303,7 +314,7 @@ class EVATUI(App):
     def _append_conv(self, role: str, body: str) -> None:
         """向对话区追加一条消息（支持 Markdown 渲染）"""
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
-        label = Text("🤖 EVA\n", style="bold #e8d5b7")
+        label = Text(f"🤖 EVA\n", style=f"bold {ROLE_COLORS.get('assistant', '#e8d5b7')}")
         content = self._render_md(body)
         bubble = Static(
             label + content,
@@ -315,7 +326,7 @@ class EVATUI(App):
     def _append_user(self, text: str) -> None:
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
         item = Static(
-            Text(f"👤 You\n{text}", style="bold #7ee8fa"),
+            Text(f"👤 You\n{text}", style=f"bold {ROLE_COLORS.get('user', '#7ee8fa')}"),
             classes="msg-user",
         )
         scroll.mount(item)
@@ -331,7 +342,7 @@ class EVATUI(App):
         args_str = "\n".join(f"{k}: {v}" for k, v in args.items())
         # 显示命令及运行中指示
         self._tool_widget = Static(
-            Text(f"🔧 {name}\n{args_str}\n⏳ 执行中...", style="bold #b8a9c9"),
+            Text(f"🔧 {name}\n{args_str}\n⏳ 执行中...", style=f"bold {ROLE_COLORS.get('tool', '#b8a9c9')}"),
             classes="msg-tool",
         )
         scroll.mount(self._tool_widget)
@@ -348,7 +359,7 @@ class EVATUI(App):
         clean = strip_ansi(result)
         display = self._truncate_at_word_boundary(clean) + ("... 省略" if len(clean) > MAX_RESULT_LEN else "")
         content = self._render_md(display)
-        label = Text(f"🔧 工具结果 [{id[:12]}...]\n", style="bold #b8a9c9")
+        label = Text(f"🔧 工具结果 [{id[:12]}...]\n", style=f"bold {ROLE_COLORS.get('tool', '#b8a9c9')}")
         scroll.mount(Static(
             label + content,
             classes="msg-tool",
@@ -358,7 +369,7 @@ class EVATUI(App):
     def _append_system(self, text: str) -> None:
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
         scroll.mount(Static(
-            Text(text, style="bold #ff6b6b"),
+            Text(text, style=f"bold {ROLE_COLORS.get('system', '#90EE90')}"),
         ))
         scroll.scroll_end(animate=False)
 
@@ -367,8 +378,9 @@ class EVATUI(App):
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
         if self._thinking_widget:
             self._thinking_widget.remove()
+        color = ROLE_COLORS.get("thinking", "#555555")
         self._thinking_widget = Static(
-            Text(f"💭 thinking: {text[:80]}", style="dim #888888"),
+            Text(f"💭 thinking: {text[:80]}", style=f"dim {color}"),
             classes="msg-thinking",
         )
         scroll.mount(self._thinking_widget)

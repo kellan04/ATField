@@ -196,8 +196,8 @@ class TestExecuteToolsAndResume:
             assert result.status == "completed"
             assert "file1" in result.content
 
-    def test_resume_string_list_creates_wrong_format(self, mock_config, mock_platform, agent_ctx, temp_workspace):
-        """验证 resume([string]) 把字符串当作用户消息（是 bug）"""
+    def test_resume_string_list_raises_typeerror(self, mock_config, mock_platform, agent_ctx, temp_workspace):
+        """验证 resume([string]) 现在会抛出 TypeError（修复了静默污染 bug）"""
         workspace, hints_file = temp_workspace
         memory = Memory(workspace, hints_file, "env")
         agent = Agent(mock_config, mock_platform, agent_ctx, memory, use_default_callbacks=False)
@@ -213,15 +213,9 @@ class TestExecuteToolsAndResume:
                 {"total_tokens": 100}
             )
 
-            # 错误的调用方式：传纯字符串列表
-            agent.resume(["file1\nfile2"])
-
-            # resume 把字符串追加到 messages，然后 LLM 返回又 append 了一条
-            # 倒数第二条是污染的 user 消息（没有 proper role）
-            polluted = agent.ctx.messages[-2]
-            # 这是个字符串而不是 dict！
-            assert isinstance(polluted, str)
-            assert "file1" in polluted
+            # 错误的调用方式：传纯字符串列表，现在应抛出 TypeError
+            with pytest.raises(TypeError, match=r"resume.*list\[dict\]"):
+                agent.resume(["file1\nfile2"])
 
 
 # ============================================================================

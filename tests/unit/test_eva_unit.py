@@ -387,7 +387,7 @@ class TestAgentStepResume:
         agent.ctx.messages = [{"role": "system", "content": "sys"}]
         agent._pending_tool_calls.clear()  # 清空避免干扰
 
-        result = agent.resume(["tool result"])
+        result = agent.resume([{"role": "tool", "tool_call_id": "abc", "name": "run_cli", "content": "tool result"}])
 
         # resume 应该调用了 llm
         assert mock_llm.called

@@ -1674,6 +1674,9 @@ class Agent:
         # TUI 模式：待执行的工具调用列表
         self._pending_tool_calls: list[dict] = []
 
+        # compact_panic off→on 转换追踪（用于事件仅发一次）
+        self._prev_compact_panic = "off"
+
         # 默认 stdout 回调（向后兼容 CLI 模式）
         if use_default_callbacks:
             self._setup_default_callbacks()
@@ -1709,12 +1712,17 @@ class Agent:
 
         return self._llm_call()
 
-    def resume(self, tool_results: list[str]) -> AgentResult:
+    def resume(self, tool_results: list[dict]) -> AgentResult:
         """
         工具执行完毕后继续推理。
-        tool_results 与 tool_calls 顺序一致。
+        tool_results: list[dict]，每项格式为：
+          {"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}
         """
         for r in tool_results:
+            if not isinstance(r, dict):
+                raise TypeError(f"resume() expects list[dict], got {type(r).__name__}")
+            if r.get("role") != "tool":
+                raise ValueError(f"resume() item must have role='tool', got {r.get('role')}")
             self.ctx.messages.append(r)
         return self._llm_call()
 
@@ -1745,6 +1753,12 @@ class Agent:
 
         # 检查状态
         if tool_calls:
+            # compact_panic 阈值检测（对标 CLI 1822-1826）
+            if self.ctx.compact_panic == "off":
+                total_tokens = usage.get("total_tokens", 0)
+                if total_tokens >= self.config.token_cap * self.config.compact_thresh:
+                    self.ctx.compact_panic = "on"
+
             self._pending_tool_calls = tool_calls
             return AgentResult(
                 status="waiting_for_tool",
@@ -1753,6 +1767,12 @@ class Agent:
                 tool_calls=tool_calls,
                 usage=usage,
             )
+
+        # off→on 转换检测：仅在切换时发一次事件
+        if self.ctx.compact_panic == "on" and self._prev_compact_panic == "off":
+            if self.on_compact_panic:
+                self.on_compact_panic()
+        self._prev_compact_panic = self.ctx.compact_panic
 
         if self.ctx.compact_panic == "on":
             return AgentResult(status="compact_panic", content=content, reasoning=reasoning, usage=usage)
@@ -2006,9 +2026,18 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
     _debug_log: list[str] = []
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     _debug_file = WORKSPACE_DIR / "debug.log"
+    _msg_counter = 0
+
+    def _next_id() -> str:
+        nonlocal _msg_counter
+        _msg_counter += 1
+        return f"msg_{_msg_counter:06d}"
 
     def _safe_print(msg: dict):
         """打印 JSON 到 stdout，忽略 BrokenPipeError"""
+        # 自动注入 message_id
+        if "message_id" not in msg:
+            msg["message_id"] = _next_id()
         try:
             print(json.dumps(msg), flush=True)
         except BrokenPipeError:
@@ -2051,35 +2080,65 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
             _safe_print(out)
             _log("DEBUG", "OUT", out)
 
+    def _run_compaction_loop():
+        """独立的压缩推进循环：每次注入 COMPACT_PROMPT 再 resume，直到 completed"""
+        while agent.ctx.compact_panic == "on":
+            agent.ctx.messages.append({"role": "user", "content": COMPACT_PROMPT})
+            result = agent.resume([])
+            if result.status == "waiting_for_tool":
+                # 压缩过程中产生工具调用，先处理工具再继续压缩
+                agent._pending_tool_calls = result.tool_calls
+                execute_tools_and_resume()
+                # 工具循环结束后，由 execute_tools_and_resume 或后续压缩完成发最终响应
+                # 此处不发送旧的 waiting_for_tool 结果，避免重复响应
+                return
+            elif result.status == "compact_panic":
+                # 仍为 compact_panic，循环继续（下轮再注入 COMPACT_PROMPT）
+                continue
+            else:
+                # completed：压缩完成，重置状态，发最终响应
+                agent.ctx.compact_panic = "off"
+                agent._prev_compact_panic = "off"
+                emit_response(result)
+                return
+
     def execute_tools_and_resume():
-        """执行工具并继续推理循环"""
-        tool_results = []
-        for tc in agent._pending_tool_calls:
-            name = tc["name"]
-            out_start = {"type": "event", "event": "tool_start", "id": tc["id"], "name": name, "args": tc["args"]}
-            _safe_print(out_start)
-            _log("DEBUG", "OUT event", out_start)
-            try:
-                res = agent.tools.execute(name, tc["args"])
-                _log("INFO", "TOOL", {"name": name, "args": tc["args"], "result_len": len(res)})
-            except Exception as e:
-                res = f"工具执行异常：{str(e)}"
-                _log("ERROR", "TOOL", {"name": name, "error": str(e)})
-            out_res = {"type": "event", "event": "tool_result", "id": tc["id"], "result": res[:TOOL_RESULT_LEN]}
-            _safe_print(out_res)
-            _log("DEBUG", "OUT event", out_res)
-            tool_results.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": name,
-                "content": clean_input(res),
-            })
-        agent.ctx.messages.extend(tool_results)
-        agent._pending_tool_calls.clear()
-        resume_result = agent.resume([])
-        emit_response(resume_result)
-        if resume_result.status == "waiting_for_tool":
-            execute_tools_and_resume()
+        """执行工具并继续推理循环（while 循环，替代递归）"""
+        while True:
+            tool_results = []
+            for tc in agent._pending_tool_calls:
+                name = tc["name"]
+                out_start = {"type": "event", "event": "tool_start", "id": tc["id"], "name": name, "args": tc["args"]}
+                _safe_print(out_start)
+                _log("DEBUG", "OUT event", out_start)
+                try:
+                    res = agent.tools.execute(name, tc["args"])
+                    _log("INFO", "TOOL", {"name": name, "args": tc["args"], "result_len": len(res)})
+                except Exception as e:
+                    res = f"工具执行异常：{str(e)}"
+                    _log("ERROR", "TOOL", {"name": name, "error": str(e)})
+                out_res = {"type": "event", "event": "tool_result", "id": tc["id"], "result": res[:TOOL_RESULT_LEN]}
+                _safe_print(out_res)
+                _log("DEBUG", "OUT event", out_res)
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": name,
+                    "content": clean_input(res),
+                })
+            agent.ctx.messages.extend(tool_results)
+            agent._pending_tool_calls.clear()
+
+            resume_result = agent.resume([])
+
+            if resume_result.status == "compact_panic":
+                # 进入压缩处理：注入 COMPACT_PROMPT 并继续推进
+                _run_compaction_loop()
+                return
+
+            emit_response(resume_result)
+            if resume_result.status != "waiting_for_tool":
+                break
 
     for line in sys.stdin:
         line = line.strip()
@@ -2090,12 +2149,20 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
         _log("DEBUG", "IN", msg)
 
         if t == "init":
-            history = msg.get("session_history", [])
+            # 与 CLI agent.run() 一致：先 build_initial_messages（含 system prompt + hints）
+            agent.ctx.messages = memory.build_initial_messages()
+            history = msg.get("session_history")
             if history:
                 agent.ctx.messages.extend(history)
                 _log("INFO", "INIT", {"history_len": len(history)})
-            _safe_print({"type": "ready"})
-            _log("DEBUG", "OUT", {"type": "ready"})
+            else:
+                # 前端无 session_history 时，从本地 session 文件恢复
+                local_history = memory.load_session()
+                if local_history:
+                    agent.ctx.messages.extend(local_history)
+                    _log("INFO", "INIT", {"loaded_local_session": len(local_history)})
+            _safe_print({"type": "ready", "protocol_version": "1.0"})
+            _log("DEBUG", "OUT", {"type": "ready", "protocol_version": "1.0"})
 
         elif t == "user_message":
             raw_content = msg["content"]
@@ -2105,9 +2172,16 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
             agent.ctx.messages.append({"role": "user", "content": clean_input(safe_content)})
             _log("INFO", "USER", {"content": safe_content[:100]})
             result = agent.step()
-            emit_response(result)
+
             if result.status == "waiting_for_tool":
+                emit_response(result)
                 execute_tools_and_resume()
+            elif result.status == "compact_panic":
+                # 理论上首次触发不应进入此分支（_llm_call 应返回 waiting_for_tool）
+                # 防御性处理：调用压缩推进函数
+                _run_compaction_loop()
+            else:
+                emit_response(result)
 
         elif t == "save_session":
             agent.memory.save_session(agent.ctx.messages)
