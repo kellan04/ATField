@@ -1206,10 +1206,12 @@ class Memory:
                     if not last_msg.get("content"):
                         del history[-1]
             size_KB = (sf.stat().st_size + 1000 - 1) // 1000
-            print(f"\n> 会话已从文件加载：{sf} ({size_KB:,} KB)")
+            if sys.stdout.isatty():
+                print(f"\n> 会话已从文件加载：{sf} ({size_KB:,} KB)")
             return history
         except json.JSONDecodeError:
-            print(f"> 会话文件损坏：{sf}")
+            if sys.stdout.isatty():
+                print(f"> 会话文件损坏：{sf}")
             return None
 
     def list_sessions(self) -> None:
