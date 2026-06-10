@@ -467,3 +467,39 @@ class TestAgentLlmCall:
 
         result = agent._llm_call()
         assert result.status == "compact_panic"
+
+    @patch("eva.llm_chat_stream")
+    def test_compact_panic_edge_event_fires_once_per_transition(
+        self, mock_llm, mock_config, mock_platform, temp_workspace
+    ):
+        """off→on 边沿事件仅触发一次；on 状态重复 _llm_call 不重复触发"""
+        workspace, hints_file = temp_workspace
+        memory = Memory(workspace, hints_file, "env")
+        ctx = AgentContext(compact_panic="off")
+
+        mock_msg = {"role": "assistant", "content": "hi"}
+        mock_llm.return_value = (mock_msg, {"total_tokens": 50})
+
+        agent = Agent(mock_config, mock_platform, ctx, memory, use_default_callbacks=False)
+        agent.ctx.messages = [{"role": "system", "content": "sys"}]
+
+        panic_calls = []
+        agent.on_compact_panic = lambda: panic_calls.append(1)
+
+        # 模拟 off→on 转换 (阈值检测在 tool_calls 分支设置了 on)
+        agent.ctx.compact_panic = "on"
+        result1 = agent._llm_call()
+        assert result1.status == "compact_panic"
+        assert len(panic_calls) == 1, "off→on 边沿应触发 on_compact_panic"
+
+        # on 状态重复 _llm_call 不应重复触发
+        result2 = agent._llm_call()
+        assert result2.status == "compact_panic"
+        assert len(panic_calls) == 1, "on 状态重复 _llm_call 不应再触发回调"
+
+        # 压缩完成重置 off，off 状态不应触发
+        agent.ctx.compact_panic = "off"
+        agent._prev_compact_panic = "off"
+        result3 = agent._llm_call()
+        assert result3.status == "completed"
+        assert len(panic_calls) == 1, "off 状态不应触发回调"
