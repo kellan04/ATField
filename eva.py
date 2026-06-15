@@ -2009,7 +2009,7 @@ PROTOCOL_REQUIRED_FIELDS = {
     "event:compact_panic": ["type", "event"],
     "message:tool_call": ["type", "id", "name", "args"],
     "message:response": ["type", "status", "content"],
-    "message:ready": ["type"],
+    "message:ready": ["type", "protocol_version", "session_id", "resumed"],
     "message:session_saved": ["type"],
     "message:pong": ["type"],
     # Frontend -> Backend
@@ -2163,8 +2163,18 @@ def run_tui_server(ctx: AgentContext, memory: Memory, config_ns, platform_ns, de
                 if local_history:
                     agent.ctx.messages.extend(local_history)
                     _log("INFO", "INIT", {"loaded_local_session": len(local_history)})
-            _safe_print({"type": "ready", "protocol_version": "1.0"})
-            _log("DEBUG", "OUT", {"type": "ready", "protocol_version": "1.0"})
+            ready_session_id = memory._session_file.stem if memory._session_file else "tui"
+            _safe_print({
+                "type": "ready",
+                "protocol_version": "1.0",
+                "session_id": ready_session_id,
+                "resumed": bool(history or local_history),
+            })
+            _log("DEBUG", "OUT", {
+                "type": "ready",
+                "session_id": ready_session_id,
+                "resumed": bool(history or local_history),
+            })
 
         elif t == "user_message":
             raw_content = msg["content"]

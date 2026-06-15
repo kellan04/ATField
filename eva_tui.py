@@ -248,6 +248,9 @@ class EVATUI(App):
         self._tool_widget: Static | None = None
         self._md_io: StringIO = StringIO()
         self._console: Console | None = None
+        self._session_id: str = ""
+        self._resumed: bool = False
+        self._seen_msg_ids: set[str] = set()
 
     def compose(self) -> ComposeResult:
         header = "EVA TUI  |  Backend: eva.py --tui"
@@ -266,10 +269,15 @@ class EVATUI(App):
         msg_type = msg.get("type")
 
         if msg_type == "ready":
+            self._session_id = msg.get("session_id", "")
+            self._resumed = bool(msg.get("resumed", False))
+            self._refresh_header()
             if self._auto_greet:
                 self.backend.send({"type": "user_message", "content": INIT_MESSAGE})
 
         elif msg_type == "event":
+            if not self._mark_seen(msg.get("message_id", "")):
+                return
             event = msg.get("event")
             if event == "thinking":
                 raw = msg.get("data", "")
@@ -292,9 +300,9 @@ class EVATUI(App):
             elif event == "tool_result":
                 with self._buf_lock:
                     self._thinking_buf.clear()
-                id = msg.get("id", "")
+                tool_id = msg.get("id", "")
                 result = msg.get("result", "")
-                self.call_from_thread(self._append_tool_result, id, result)
+                self.call_from_thread(self._append_tool_result, tool_id, result)
             elif event == "compact_panic":
                 self.call_from_thread(self._append_system, "⚠️ 记忆压缩触发")
 
@@ -340,9 +348,12 @@ class EVATUI(App):
         self._console = None
 
     def _append_conv(self, role: str, body: str) -> None:
-        """向对话区追加一条消息（支持 Markdown 渲染）"""
+        """向对话区追加一条消息（label/icon/color 跟随 role）"""
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
-        label = Text(f"🤖 EVA\n", style=f"bold {ROLE_COLORS.get('assistant', '#e8d5b7')}")
+        color = ROLE_COLORS.get(role, ROLE_COLORS["assistant"])
+        icon = ROLE_ICONS.get(role, ROLE_ICONS["assistant"])
+        label_text = ROLE_LABELS.get(role, role.title())
+        label = Text(f"{icon} {label_text}\n", style=f"bold {color}")
         content = self._render_md(body)
         bubble = Static(
             label + content,
@@ -350,6 +361,29 @@ class EVATUI(App):
         )
         scroll.mount(bubble)
         scroll.scroll_end(animate=False)
+
+    def _mark_seen(self, msg_id: str) -> bool:
+        """return True if message should be rendered (id unseen or empty)"""
+        if not msg_id:
+            return True
+        if msg_id in self._seen_msg_ids:
+            return False
+        self._seen_msg_ids.add(msg_id)
+        return True
+
+    def _refresh_header(self) -> None:
+        """刷新 header 文本（DEBUG + resumed 指示）"""
+        parts = ["EVA TUI  |  Backend: eva.py --tui"]
+        if getattr(self, "_debug", False):
+            parts.append("DEBUG")
+        session_id = getattr(self, "_session_id", "") or ""
+        if getattr(self, "_resumed", False) and session_id:
+            parts.append(f"resumed:{session_id[:8]}")
+        header = "  |  ".join(parts)
+        try:
+            self.query_one("#header_bar", Static).update(header)
+        except Exception:
+            pass
 
     def _append_user(self, text: str) -> None:
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
@@ -376,7 +410,7 @@ class EVATUI(App):
         scroll.mount(self._tool_widget)
         scroll.scroll_end(animate=False)
 
-    def _append_tool_result(self, id: str, result: str) -> None:
+    def _append_tool_result(self, tool_id: str, result: str) -> None:
         """显示工具执行结果（替换运行中指示）"""
         scroll = self.query_one("#conv_scroll", ScrollableContainer)
         # 移除运行中 widget（不删 thinking_widget，等 finalize 再删）
@@ -387,7 +421,7 @@ class EVATUI(App):
         clean = strip_ansi(result)
         display = self._truncate_at_word_boundary(clean) + ("... 省略" if len(clean) > MAX_RESULT_LEN else "")
         content = self._render_md(display)
-        label = Text(f"🔧 工具结果 [{id[:12]}...]\n", style=f"bold {ROLE_COLORS.get('tool', '#b8a9c9')}")
+        label = Text(f"🔧 工具结果 [{tool_id[:12]}...]\n", style=f"bold {ROLE_COLORS.get('tool', '#b8a9c9')}")
         scroll.mount(Static(
             label + content,
             classes="msg-tool",
@@ -458,6 +492,8 @@ class EVATUI(App):
             self._append_conv("assistant", full)
 
         self.backend.send({"type": "save_session"})
+        # 一轮结束：清空 dedupe 集合，下一轮重新计数
+        self._seen_msg_ids.clear()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         user_text = event.value.strip()
@@ -467,6 +503,7 @@ class EVATUI(App):
         with self._buf_lock:
             self._thinking_buf.clear()
             self._content_buf.clear()
+        self._seen_msg_ids.clear()  # 新一轮：dedupe 重置
         self._thinking_widget = None
         self._tool_widget = None
         self._clear_conv_widgets()
@@ -490,12 +527,7 @@ class EVATUI(App):
     def action_toggle_debug(self) -> None:
         """切换 debug 模式（仅前端日志，不影响后端）"""
         self._debug = not self._debug
-        try:
-            self.query_one("#header_bar", Static).update(
-                f"EVA TUI  |  Backend: eva.py --tui  [{'DEBUG ON' if self._debug else 'DEBUG OFF'}]"
-            )
-        except Exception:
-            pass
+        self._refresh_header()
 
     def on_unmount(self) -> None:
         """textual 卸载兜底：保证后端进程不残留（含 ctrl-c 路径）"""

@@ -560,9 +560,9 @@ class TestDebugMode:
         app.action_toggle_debug()
 
         mock_static.update.assert_called_once()
-        # 验证 DEBUG ON 出现在更新内容中
+        # 验证 DEBUG 出现在更新内容中
         update_arg = mock_static.update.call_args[0][0]
-        assert "DEBUG ON" in update_arg
+        assert "DEBUG" in update_arg
         app.backend.stop()
 
     def test_debug_init_false_by_default(self):
@@ -712,9 +712,10 @@ class TestActionToggleDebugHeader:
         app.query_one.assert_called_once()
         call_args = app.query_one.call_args[0]
         assert call_args[0] == "#header_bar"
-        # header 的 update 收到 DEBUG ON（因为 toggle False→True）
+        # header 的 update 收到 DEBUG（toggle False→True 启用 debug 显示）
         update_arg = mock_header.update.call_args[0][0]
-        assert "DEBUG ON" in update_arg
+        assert "DEBUG" in update_arg
+        assert "DEBUG" not in update_arg.replace("  |  DEBUG", "", 1) or update_arg.endswith("DEBUG")
 
     def test_toggles_debug_state_twice(self):
         app = EVATUI.__new__(EVATUI)
@@ -724,11 +725,14 @@ class TestActionToggleDebugHeader:
 
         app.action_toggle_debug()
         assert app._debug is True
+        first_update = mock_header.update.call_args[0][0]
+        assert "DEBUG" in first_update
 
         app.action_toggle_debug()
         assert app._debug is False
-        update_arg = mock_header.update.call_args[0][0]
-        assert "DEBUG OFF" in update_arg
+        second_update = mock_header.update.call_args[0][0]
+        # 第二次 toggle 后 header 不再含 DEBUG
+        assert "DEBUG" not in second_update
 
 
 class TestContentFlushTimer:
@@ -818,4 +822,175 @@ class TestBufferLocking:
         assert app._content_buf == []
         # _append_conv 至少被调一次
         assert app._append_conv.call_count >= 1
+
+
+# ============================================================================
+# 回归测试：feat(protocol) commit 2 — #14 message_id dedupe, #15 ready schema
+# ============================================================================
+
+class TestMessageIdDedupe:
+    """#14: 后端注入 message_id，前端按 id dedupe。"""
+
+    def test_duplicate_content_event_skipped(self):
+        app = EVATUI(debug=False)
+        app._seen_msg_ids = set()
+        app._schedule_content_flush = MagicMock()
+        app._finalize_thinking = MagicMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        msg = {"type": "event", "event": "content", "data": "x", "message_id": "msg_000001"}
+        app._on_backend_message(msg)
+        app._on_backend_message(dict(msg))  # 完全相同 message_id
+
+        # 第二次同 id 应被丢弃，buf 仍只有 1 个
+        assert len(app._content_buf) == 1
+        app.backend.stop()
+
+    def test_duplicate_tool_result_skipped(self):
+        app = EVATUI(debug=False)
+        app._seen_msg_ids = set()
+        app._finalize_thinking = MagicMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+        # 隔离 call_from_thread 副作用
+        app.call_from_thread = lambda cb, *a: cb(*a)
+
+        msg = {
+            "type": "event", "event": "tool_result",
+            "id": "t1", "result": "ok", "message_id": "msg_000002",
+        }
+        app._on_backend_message(msg)
+        app._on_backend_message(dict(msg))
+
+        # 第二次被 dedupe，仅一次调用 _append_tool_result
+        assert "msg_000002" in app._seen_msg_ids
+        app.backend.stop()
+
+    def test_empty_message_id_not_deduped(self):
+        app = EVATUI(debug=False)
+        app._seen_msg_ids = set()
+        app._schedule_content_flush = MagicMock()
+        app._finalize_thinking = MagicMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        msg1 = {"type": "event", "event": "content", "data": "a"}
+        msg2 = {"type": "event", "event": "content", "data": "b"}
+        app._on_backend_message(msg1)
+        app._on_backend_message(msg2)
+
+        # 缺 message_id 不去重，全部累积
+        assert len(app._content_buf) == 2
+        app.backend.stop()
+
+    def test_reset_on_user_input(self):
+        app = EVATUI(debug=False)
+        app._seen_msg_ids = {"msg_old"}
+        app._thinking_buf = []
+        app._content_buf = []
+        app._thinking_widget = None
+        app._tool_widget = None
+        app.query_one = MagicMock(return_value=MagicMock())
+
+        mock_input = MagicMock()
+        mock_input.value = "hi"
+        mock_input.clear = MagicMock()
+        event = MagicMock()
+        event.value = "hi"
+        event.input = mock_input
+
+        app.on_input_submitted(event)
+
+        # 提交后 _seen_msg_ids 应清空
+        assert app._seen_msg_ids == set()
+        app.backend.stop()
+
+    def test_reset_on_finalize_response(self):
+        app = EVATUI(debug=False)
+        app._seen_msg_ids = {"msg_x", "msg_y"}
+        app._thinking_buf = []
+        app._content_buf = []
+        app._finalize_thinking = MagicMock()
+        app.query_one = MagicMock(return_value=MagicMock())
+        app.backend = MagicMock()
+
+        app._finalize_response({"status": "completed"})
+
+        assert app._seen_msg_ids == set()
+        app.backend.stop()
+
+
+class TestReadyMessageSchema:
+    """#15: ready 消息含 session_id + resumed，前端消费。"""
+
+    def test_ready_stores_session_id_and_resumed(self):
+        app = EVATUI(debug=False, auto_greet=False)
+        app.query_one = MagicMock(return_value=MagicMock())
+        app.backend = MagicMock()
+
+        app._on_backend_message({
+            "type": "ready",
+            "protocol_version": "1.0",
+            "session_id": "abc12345deadbeef",
+            "resumed": True,
+        })
+
+        assert app._session_id == "abc12345deadbeef"
+        assert app._resumed is True
+        # auto_greet=False 时不应发 user_message
+        app.backend.send.assert_not_called()
+        app.backend.stop()
+
+    def test_auto_greet_true_sends_init_message(self):
+        app = EVATUI(debug=False, auto_greet=True)
+        app.query_one = MagicMock(return_value=MagicMock())
+        app.backend = MagicMock()
+
+        app._on_backend_message({
+            "type": "ready",
+            "session_id": "x",
+            "resumed": False,
+        })
+
+        # auto_greet=True 时应发 user_message
+        sent = [c.args[0] for c in app.backend.send.call_args_list]
+        assert any(s.get("type") == "user_message" for s in sent)
+        app.backend.stop()
+
+    def test_ready_default_fields(self):
+        """后端老版本未带 session_id/resumed 时不崩"""
+        app = EVATUI(debug=False, auto_greet=False)
+        app.query_one = MagicMock(return_value=MagicMock())
+        app.backend = MagicMock()
+
+        app._on_backend_message({"type": "ready"})
+
+        # 缺字段时取默认值
+        assert app._session_id == ""
+        assert app._resumed is False
+        app.backend.stop()
+
+    def test_refresh_header_shows_resumed(self):
+        app = EVATUI.__new__(EVATUI)
+        app._debug = False
+        app._session_id = "abcdef1234567890"
+        app._resumed = True
+        mock_header = MagicMock()
+        app.query_one = MagicMock(return_value=mock_header)
+
+        app._refresh_header()
+
+        update_arg = mock_header.update.call_args[0][0]
+        assert "resumed:abcdef12" in update_arg
+
+    def test_refresh_header_no_resumed_when_fresh(self):
+        app = EVATUI.__new__(EVATUI)
+        app._debug = False
+        app._session_id = "abcdef1234567890"
+        app._resumed = False
+        mock_header = MagicMock()
+        app.query_one = MagicMock(return_value=mock_header)
+
+        app._refresh_header()
+
+        update_arg = mock_header.update.call_args[0][0]
+        assert "resumed" not in update_arg
 

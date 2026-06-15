@@ -35,7 +35,7 @@ class TestProtocolField完整性:
 
     def test_ready_必填字段(self):
         fields = PROTOCOL_REQUIRED_FIELDS["message:ready"]
-        assert fields == ["type"]
+        assert fields == ["type", "protocol_version", "session_id", "resumed"]
 
     def test_user_message_必填字段(self):
         fields = PROTOCOL_REQUIRED_FIELDS["message:user_message"]
