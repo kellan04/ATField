@@ -178,61 +178,6 @@ class TestEvaBackendIntegration:
 # TUI Component Tests
 # ============================================================================
 
-class TestMessageBubbleRendering:
-    """测试 MessageBubble 渲染"""
-
-    def test_user_role(self):
-        from eva_tui import MessageBubble
-
-        bubble = MessageBubble(role="user", body="hello world")
-        text = bubble.render()
-        text_str = str(text)
-        assert "👤" in text_str
-        assert "hello world" in text_str
-        assert "You" in text_str
-
-    def test_assistant_role(self):
-        from eva_tui import MessageBubble
-
-        bubble = MessageBubble(role="assistant", body="I am EVA")
-        text = bubble.render()
-        text_str = str(text)
-        assert "🤖" in text_str
-        assert "EVA" in text_str
-
-    def test_tool_role(self):
-        from eva_tui import MessageBubble
-
-        bubble = MessageBubble(role="tool", body="ls output")
-        text = bubble.render()
-        text_str = str(text)
-        assert "🔧" in text_str
-
-    def test_system_role(self):
-        from eva_tui import MessageBubble
-
-        bubble = MessageBubble(role="system", body="system message")
-        text = bubble.render()
-        text_str = str(text)
-        assert "⚙️" in text_str
-
-    def test_thinking_role(self):
-        from eva_tui import MessageBubble
-
-        bubble = MessageBubble(role="thinking", body="reasoning...")
-        text = bubble.render()
-        text_str = str(text)
-        assert "💭" in text_str
-
-    def test_unknown_role(self):
-        from eva_tui import MessageBubble
-
-        bubble = MessageBubble(role="unknown", body="test")
-        text = bubble.render()
-        text_str = str(text)
-        assert "test" in text_str
-
-
 class TestEVATUIStructure:
     """测试 EVATUI 类结构"""
 

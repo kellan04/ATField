@@ -141,26 +141,6 @@ PLACEHOLDER_TEXT: str = "输入你的问题，按 Enter 发送..."
 INIT_MESSAGE: str = "你好，介绍一下你自己"
 
 
-# ============================================================================
-# MessageBubble
-# ============================================================================
-
-class MessageBubble(Static):
-    """单条消息气泡（支持 Markdown/JSON）"""
-
-    def __init__(self, role: str, body: str, **kwargs):
-        self.role = role
-        self.body = body
-        super().__init__(**kwargs)
-
-    def render(self) -> Text:
-        color = ROLE_COLORS.get(self.role, "#ffffff")
-        icon = ROLE_ICONS.get(self.role, "💬")
-        role_label = ROLE_LABELS.get(self.role, self.role.title())
-        label = f"{icon} {role_label}"
-        return Text(f"{label}\n{self.body}", style=f"bold {color}")
-
-
 class EVATUI(App):
     """EVA 终端图形化界面（薄前端）"""
 

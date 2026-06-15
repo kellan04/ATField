@@ -6,7 +6,6 @@ import pytest
 from eva_tui import (
     EVATUI,
     EvaBackend,
-    MessageBubble,
 )
 
 
@@ -28,27 +27,6 @@ class TestEvaBackend:
         # 后端应该在 stdout 写入 pong
         # 由于 daemon reader，不会收到消息
         backend.stop()
-
-
-class TestMessageBubble:
-    """MessageBubble 组件测试"""
-
-    def test_render_user(self):
-        bubble = MessageBubble(role="user", body="hello")
-        text = bubble.render()
-        assert "👤" in str(text)
-        assert "hello" in str(text)
-
-    def test_render_assistant(self):
-        bubble = MessageBubble(role="assistant", body="hi there")
-        text = bubble.render()
-        assert "🤖" in str(text)
-        assert "hi there" in str(text)
-
-    def test_render_tool(self):
-        bubble = MessageBubble(role="tool", body="ls output")
-        text = bubble.render()
-        assert "🔧" in str(text)
 
 
 class TestEVATUI:

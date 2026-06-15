@@ -12,7 +12,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from eva_tui import (
     EVATUI,
     EvaBackend,
-    MessageBubble,
 )
 
 
@@ -61,63 +60,6 @@ class TestEvaBackend:
         # stop() 应该清理子进程：进程已退出，returncode 非 None
         assert backend.proc.poll() is not None
         # 收到 pong 最好，但不强制（daemon 线程时序不确定）
-
-
-# ============================================================================
-# MessageBubble Tests
-# ============================================================================
-
-class TestMessageBubble:
-    """MessageBubble 组件测试"""
-
-    def test_render_user(self):
-        bubble = MessageBubble(role="user", body="hello")
-        text = bubble.render()
-        text_str = str(text)
-        assert "👤" in text_str
-        assert "hello" in text_str
-        assert "You" in text_str
-
-    def test_render_assistant(self):
-        bubble = MessageBubble(role="assistant", body="hi there")
-        text = bubble.render()
-        text_str = str(text)
-        assert "🤖" in text_str
-        assert "hi there" in text_str
-
-    def test_render_tool(self):
-        bubble = MessageBubble(role="tool", body="ls output")
-        text = bubble.render()
-        text_str = str(text)
-        assert "🔧" in text_str
-        assert "ls output" in text_str
-
-    def test_render_system(self):
-        bubble = MessageBubble(role="system", body="system msg")
-        text = bubble.render()
-        text_str = str(text)
-        assert "⚙️" in text_str
-
-    def test_render_thinking(self):
-        bubble = MessageBubble(role="thinking", body="reasoning...")
-        text = bubble.render()
-        text_str = str(text)
-        assert "💭" in text_str
-
-    def test_render_unknown_role(self):
-        bubble = MessageBubble(role="unknown", body="test")
-        text = bubble.render()
-        text_str = str(text)
-        assert "test" in text_str
-
-    def test_different_body_same_role(self):
-        """同一 role 不同 body"""
-        b1 = MessageBubble(role="user", body="first")
-        b2 = MessageBubble(role="user", body="second")
-        t1 = str(b1.render())
-        t2 = str(b2.render())
-        assert "first" in t1
-        assert "second" in t2
 
 
 # ============================================================================
