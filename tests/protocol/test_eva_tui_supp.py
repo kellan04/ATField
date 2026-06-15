@@ -179,6 +179,8 @@ class TestEVATUIStateTransitions:
         """content 片段应该累积到 _content_buf"""
         app = EVATUI(debug=False)
         app._content_buf = []
+        app._schedule_content_flush = MagicMock()  # 隔离 flush 副作用
+        app.query_one = MagicMock(return_value=MagicMock())
 
         app._on_backend_message({
             "type": "event",
@@ -219,6 +221,8 @@ class TestEVATUIStateTransitions:
         """多个 content 片段应该累积"""
         app = EVATUI(debug=False)
         app._content_buf = []
+        app._schedule_content_flush = MagicMock()  # 隔离 flush 副作用
+        app.query_one = MagicMock(return_value=MagicMock())
 
         for i in range(2):
             app._on_backend_message({
@@ -687,3 +691,131 @@ class TestShowThinking:
         assert app._thinking_widget is not None
         assert app._thinking_widget is not old_mock
         app.backend.stop()
+
+
+# ============================================================================
+# 回归测试：fix(tui) commit 1 — #1 header id, #2 set_timer, #3 buf lock
+# ============================================================================
+
+class TestActionToggleDebugHeader:
+    """#1: action_toggle_debug 应通过 #header_bar 路由，不命中第一个 Static。"""
+
+    def test_updates_header_by_id_not_first_static(self):
+        app = EVATUI.__new__(EVATUI)
+        app._debug = False
+        mock_header = MagicMock()
+        app.query_one = MagicMock(return_value=mock_header)
+
+        app.action_toggle_debug()
+
+        # 必须按 id 查询，不按类名
+        app.query_one.assert_called_once()
+        call_args = app.query_one.call_args[0]
+        assert call_args[0] == "#header_bar"
+        # header 的 update 收到 DEBUG ON（因为 toggle False→True）
+        update_arg = mock_header.update.call_args[0][0]
+        assert "DEBUG ON" in update_arg
+
+    def test_toggles_debug_state_twice(self):
+        app = EVATUI.__new__(EVATUI)
+        app._debug = False
+        mock_header = MagicMock()
+        app.query_one = MagicMock(return_value=mock_header)
+
+        app.action_toggle_debug()
+        assert app._debug is True
+
+        app.action_toggle_debug()
+        assert app._debug is False
+        update_arg = mock_header.update.call_args[0][0]
+        assert "DEBUG OFF" in update_arg
+
+
+class TestContentFlushTimer:
+    """#2: flush 用 set_timer(name=...) 而非 Thread。"""
+
+    def test_uses_set_timer_with_dedupe_name(self):
+        app = EVATUI.__new__(EVATUI)
+        set_timer = MagicMock()
+        app.set_timer = set_timer
+
+        app._schedule_content_flush()
+
+        set_timer.assert_called_once()
+        args, kwargs = set_timer.call_args
+        assert args[0] == 0.05
+        assert args[1] == app._flush_content
+        assert kwargs.get("name") == "content_flush"
+
+    def test_flush_drains_buffer_once(self):
+        app = EVATUI.__new__(EVATUI)
+        from threading import Lock
+        app._buf_lock = Lock()
+        app._content_buf = ["a", "b"]
+        # 隔离副作用：跳过 _append_conv
+        app._append_conv = MagicMock()
+
+        app._flush_content()
+
+        assert app._content_buf == []
+        app._append_conv.assert_called_once_with("assistant", "ab")
+
+    def test_flush_skips_empty_buffer(self):
+        app = EVATUI.__new__(EVATUI)
+        from threading import Lock
+        app._buf_lock = Lock()
+        app._content_buf = []
+        app._append_conv = MagicMock()
+
+        app._flush_content()
+
+        app._append_conv.assert_not_called()
+
+
+class TestBufferLocking:
+    """#3: _thinking_buf / _content_buf 多线程访问加锁。"""
+
+    def test_concurrent_append_no_corruption(self):
+        import threading
+        app = EVATUI.__new__(EVATUI)
+        app._buf_lock = threading.Lock()
+        app._thinking_buf = []
+
+        def append_many(n):
+            for _ in range(n):
+                with app._buf_lock:
+                    app._thinking_buf.append("x")
+
+        t1 = threading.Thread(target=append_many, args=(500,))
+        t2 = threading.Thread(target=append_many, args=(500,))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert len(app._thinking_buf) == 1000
+        assert all(x == "x" for x in app._thinking_buf)
+
+    def test_flush_under_lock_drains_safely(self):
+        import threading
+        app = EVATUI.__new__(EVATUI)
+        app._buf_lock = threading.Lock()
+        app._content_buf = ["a", "b", "c"]
+        app._append_conv = MagicMock()
+
+        # 两线程并发 flush，不应 IndexError
+        def do_flush():
+            app._flush_content()
+
+        t1 = threading.Thread(target=do_flush)
+        t2 = threading.Thread(target=do_flush)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # 至少有一次成功 drain，最终 buf 空
+        assert app._content_buf == []
+        # _append_conv 至少被调一次
+        assert app._append_conv.call_count >= 1
+

@@ -58,8 +58,8 @@ class TestEvaBackend:
         time.sleep(1.0)  # 等待 daemon 线程处理
         backend.stop()
 
-        # 验证 reader 没有崩溃，进程仍在运行
-        assert backend.proc.poll() is None
+        # stop() 应该清理子进程：进程已退出，returncode 非 None
+        assert backend.proc.poll() is not None
         # 收到 pong 最好，但不强制（daemon 线程时序不确定）
 
 

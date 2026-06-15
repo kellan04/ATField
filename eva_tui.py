@@ -10,10 +10,9 @@ import json
 import re
 import subprocess
 import sys
-import time
 from io import StringIO
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Callable
 
 from rich.console import Console
@@ -42,16 +41,19 @@ def strip_ansi(text: str) -> str:
 # EvaBackend — 子进程管理
 # ============================================================================
 
+EVA_DIR = Path(__file__).resolve().parent
+EVA_SCRIPT = EVA_DIR / "eva.py"
+
+
 class EvaBackend:
     """管理 eva.py 子进程通信"""
 
     def __init__(self, debug: bool = False, allow_all_cli: bool = False):
         self._debug = debug
-        self._debug_log: list[str] = []
-        Path(".eva").mkdir(exist_ok=True)
-        self._debug_file = Path(".eva") / "debug.log"
+        (EVA_DIR / ".eva").mkdir(exist_ok=True)
+        self._debug_file = EVA_DIR / ".eva" / "debug.log"
 
-        args = [sys.executable, "eva.py", "--tui"]
+        args = [sys.executable, str(EVA_SCRIPT), "--tui"]
         if debug:
             args.append("--debug")
         if allow_all_cli:
@@ -63,22 +65,25 @@ class EvaBackend:
             stdout=subprocess.PIPE,
             text=True,
             bufsize=1,
+            cwd=str(EVA_DIR),
         )
 
-    def _log(self, direction: str, msg: dict):
+    def _log(self, direction: str, msg: dict) -> None:
         if not self._debug:
             return
         ts = dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        line = f"[{ts}] FRONTEND {direction} {json.dumps(msg, ensure_ascii=False)[:200]}"
-        self._debug_log.append(line)
-        self._debug_file.write_text("\n".join(self._debug_log) + "\n", encoding="utf-8")
+        line = f"[{ts}] FRONTEND {direction} {json.dumps(msg, ensure_ascii=False)[:200]}\n"
+        with self._debug_file.open("a", encoding="utf-8") as f:
+            f.write(line)
 
     def send(self, msg: dict) -> None:
         self._log("OUT", msg)
+        assert self.proc.stdin is not None
         self.proc.stdin.write(json.dumps(msg) + "\n")
         self.proc.stdin.flush()
 
     def _reader_loop(self, on_message: Callable[[dict], None]) -> None:
+        assert self.proc.stdout is not None
         for line in self.proc.stdout:
             try:
                 msg = json.loads(line.strip())
@@ -96,7 +101,13 @@ class EvaBackend:
         t.start()
 
     def stop(self) -> None:
-        self.proc.terminate()
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=1.0)
 
 
 # ============================================================================
@@ -219,25 +230,30 @@ class EVATUI(App):
         Binding("ctrl+d", "toggle_debug", "Debug", show=False),
     ]
 
-    def __init__(self, debug: bool = False, allow_all_cli: bool = False):
+    def __init__(
+        self,
+        debug: bool = False,
+        allow_all_cli: bool = False,
+        auto_greet: bool = True,
+    ):
         super().__init__()
         self._debug = debug
         self._allow_all_cli = allow_all_cli
+        self._auto_greet = auto_greet
         self.backend = EvaBackend(debug=debug, allow_all_cli=allow_all_cli)
         self._thinking_buf: list[str] = []
         self._content_buf: list[str] = []
+        self._buf_lock = Lock()
         self._thinking_widget: Static | None = None
         self._tool_widget: Static | None = None
-        self._console = Console(file=StringIO(), width=120, force_terminal=False)
-        self._content_pending = False
-        self._content_flush_time = 0.0
-        self._flush_interval = 0.05  # 50ms
+        self._md_io: StringIO = StringIO()
+        self._console: Console | None = None
 
     def compose(self) -> ComposeResult:
         header = "EVA TUI  |  Backend: eva.py --tui"
         if self._debug:
             header += "  [DEBUG]"
-        yield Static(header, classes="header")
+        yield Static(header, classes="header", id="header_bar")
         yield ScrollableContainer(id="conv_scroll")
         yield Input(placeholder=PLACEHOLDER_TEXT, id="user_input")
 
@@ -250,28 +266,32 @@ class EVATUI(App):
         msg_type = msg.get("type")
 
         if msg_type == "ready":
-            # 后端就绪后，发送初始消息
-            self.backend.send({"type": "user_message", "content": INIT_MESSAGE})
+            if self._auto_greet:
+                self.backend.send({"type": "user_message", "content": INIT_MESSAGE})
 
         elif msg_type == "event":
             event = msg.get("event")
             if event == "thinking":
                 raw = msg.get("data", "")
-                self._thinking_buf.append(strip_ansi(raw))
-                full = "".join(self._thinking_buf)
+                with self._buf_lock:
+                    self._thinking_buf.append(strip_ansi(raw))
+                    full = "".join(self._thinking_buf)
                 self.call_from_thread(self._show_thinking, full[:80])
             elif event == "content":
                 self._finalize_thinking()
-                self._content_buf.append(msg.get("data", ""))
+                with self._buf_lock:
+                    self._content_buf.append(msg.get("data", ""))
                 self._schedule_content_flush()
             elif event == "tool_start":
-                self._thinking_buf.clear()
+                with self._buf_lock:
+                    self._thinking_buf.clear()
                 self._finalize_thinking()
                 name = msg.get("name", "?")
                 args = msg.get("args", {})
                 self.call_from_thread(self._append_tool_start, name, args)
             elif event == "tool_result":
-                self._thinking_buf.clear()
+                with self._buf_lock:
+                    self._thinking_buf.clear()
                 id = msg.get("id", "")
                 result = msg.get("result", "")
                 self.call_from_thread(self._append_tool_result, id, result)
@@ -299,17 +319,25 @@ class EVATUI(App):
         return truncated
 
     def _render_md(self, text: str) -> Text:
-        """将 Markdown 文本渲染为 Rich Text"""
+        """将 Markdown 文本渲染为 Rich Text（width 跟随终端）"""
         clean = strip_ansi(text)
+        size = getattr(self, "size", None)
+        w = size.width if size else 80
         console = getattr(self, "_console", None)
-        if console is None:
-            console = Console(file=StringIO(), width=120, force_terminal=False)
+        if console is None or console.width != w:
+            self._md_io = StringIO()
+            console = Console(
+                file=self._md_io, width=max(40, w - 4), force_terminal=False
+            )
+            self._console = console
         else:
-            console.file.truncate(0)
-            console.file.seek(0)
+            self._md_io.truncate(0)
+            self._md_io.seek(0)
         console.print(RichMarkdown(clean))
-        rendered = console.file.getvalue()
-        return Text.from_ansi(rendered)
+        return Text.from_ansi(self._md_io.getvalue())
+
+    def on_resize(self) -> None:
+        self._console = None
 
     def _append_conv(self, role: str, body: str) -> None:
         """向对话区追加一条消息（支持 Markdown 渲染）"""
@@ -393,47 +421,31 @@ class EVATUI(App):
             self._thinking_widget = None
 
     def _schedule_content_flush(self) -> None:
-        """节流：避免每字一次 DOM 操作，改为定时批量渲染"""
-        if self._content_pending:
-            return
-        self._content_pending = True
-        self._content_flush_time = time.time() + self._flush_interval
+        """节流：50ms 内的 content 批量渲染一次。Textual set_timer 按 name dedupe。"""
         try:
-            self.call_from_thread(self._flush_content)
+            self.set_timer(0.05, self._flush_content, name="content_flush")
         except RuntimeError:
-            # App not running (test context) — flush immediately
+            # 无 event loop（test 上下文）— 同步 flush
             self._flush_content()
 
     def _flush_content(self) -> None:
-        """定时批量渲染累积的 content buffer"""
-        now = time.time()
-        if now < self._content_flush_time:
-            # 还没到时间，重新调度
-            remaining = self._content_flush_time - now
-            self._content_pending = False
-            def reschedule():
-                time.sleep(remaining)
-                try:
-                    self.call_from_thread(self._schedule_content_flush)
-                except RuntimeError:
-                    pass
-            t = Thread(target=reschedule, daemon=True)
-            t.start()
-            return
-        if not self._content_buf:
-            self._content_pending = False
-            return
-        full = "".join(self._content_buf)
-        self._content_buf.clear()
-        self._content_pending = False
+        """批量渲染累积的 content buffer"""
+        with self._buf_lock:
+            if not self._content_buf:
+                return
+            full = "".join(self._content_buf)
+            self._content_buf.clear()
         self._append_conv("assistant", full)
 
     def _finalize_response(self, msg: dict) -> None:
         """处理后端最终响应"""
         self._finalize_thinking()
 
-        thinking_text = "".join(self._thinking_buf)
-        content_text = "".join(self._content_buf)
+        with self._buf_lock:
+            thinking_text = "".join(self._thinking_buf)
+            content_text = "".join(self._content_buf)
+            self._thinking_buf = []
+            self._content_buf = []
 
         if thinking_text and content_text:
             full = f"💭 *thinking:*\n_{thinking_text}_\n\n---\n\n{content_text}"
@@ -446,16 +458,15 @@ class EVATUI(App):
             self._append_conv("assistant", full)
 
         self.backend.send({"type": "save_session"})
-        self._thinking_buf = []
-        self._content_buf = []
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         user_text = event.value.strip()
         if not user_text:
             return
         # 清空后立即发送（非事务性，但保证UI先清理）
-        self._thinking_buf.clear()
-        self._content_buf.clear()
+        with self._buf_lock:
+            self._thinking_buf.clear()
+            self._content_buf.clear()
         self._thinking_widget = None
         self._tool_widget = None
         self._clear_conv_widgets()
@@ -477,11 +488,18 @@ class EVATUI(App):
             pass
 
     def action_toggle_debug(self) -> None:
-        """切换 debug 模式"""
+        """切换 debug 模式（仅前端日志，不影响后端）"""
         self._debug = not self._debug
-        self.query_one("Static").update(
-            f"EVA TUI  |  Backend: eva.py --tui  [{'DEBUG ON' if self._debug else 'DEBUG OFF'}]"
-        )
+        try:
+            self.query_one("#header_bar", Static).update(
+                f"EVA TUI  |  Backend: eva.py --tui  [{'DEBUG ON' if self._debug else 'DEBUG OFF'}]"
+            )
+        except Exception:
+            pass
+
+    def on_unmount(self) -> None:
+        """textual 卸载兜底：保证后端进程不残留（含 ctrl-c 路径）"""
+        self.backend.stop()
 
 
 # ============================================================================
@@ -492,8 +510,20 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="EVA TUI")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("-a", "--allow-all", action="store_true", help="Allow all CLI commands (dangerous)")
+    parser.add_argument(
+        "--no-greet",
+        action="store_true",
+        help="Skip the auto greeting message on backend ready",
+    )
+    parser.add_argument(
+        "-a", "--allow-all", action="store_true",
+        help="Allow all CLI commands (dangerous)",
+    )
     args = parser.parse_args()
 
-    app = EVATUI(debug=args.debug, allow_all_cli=args.allow_all)
+    app = EVATUI(
+        debug=args.debug,
+        allow_all_cli=args.allow_all,
+        auto_greet=not args.no_greet,
+    )
     app.run()
